@@ -47,11 +47,46 @@ const ENABLE_PREMARKET = (process.env.ENABLE_PREMARKET || 'true').toLowerCase() 
 
 const TZ = 'America/New_York';
 
+// ============================================================
+// Channel routing — each event type goes to its own webhook.
+// If a channel-specific webhook is missing, falls back to
+// DISCORD_WEBHOOK_URL (the original default channel) so nothing
+// is lost during partial setup.
+// ============================================================
+const CHANNELS = {
+  signals:  process.env.DISCORD_WEBHOOK_SIGNALS  || DISCORD_WEBHOOK_URL,
+  micro:    process.env.DISCORD_WEBHOOK_MICRO    || DISCORD_ALERTS_WEBHOOK_URL,
+  macro:    process.env.DISCORD_WEBHOOK_MACRO    || DISCORD_WEBHOOK_URL,
+  earnings: process.env.DISCORD_WEBHOOK_EARNINGS || DISCORD_WEBHOOK_URL,
+  darkpool: process.env.DISCORD_WEBHOOK_DARKPOOL || DISCORD_WEBHOOK_URL,
+  fomc:     process.env.DISCORD_WEBHOOK_FOMC     || DISCORD_ALERTS_WEBHOOK_URL,
+  lookups:  process.env.DISCORD_WEBHOOK_LOOKUPS  || DISCORD_WEBHOOK_URL,
+  backtest: process.env.DISCORD_WEBHOOK_BACKTEST || DISCORD_WEBHOOK_URL
+};
+
+const _fallbackWarned = new Set();
+function route(channel) {
+  const url = CHANNELS[channel];
+  if (!url) {
+    if (!_fallbackWarned.has(channel)) {
+      console.warn(`[${ts()}] ⚠️  No webhook configured for #${channel} — events will be dropped.`);
+      _fallbackWarned.add(channel);
+    }
+    return null;
+  }
+  const expected = `DISCORD_WEBHOOK_${channel.toUpperCase()}`;
+  if (!process.env[expected] && !_fallbackWarned.has(channel)) {
+    console.log(`[${ts()}] ℹ️  #${channel} using fallback webhook (set ${expected} for dedicated channel).`);
+    _fallbackWarned.add(channel);
+  }
+  return url;
+}
+
 // --- In-memory state ---
 const state = {
   lastDarkpoolAggressor: null,
   lastRegime: null,
-  lastWebhookPostAt: new Map() // webhookUrl -> timestamp
+  lastWebhookPostAt: new Map()
 };
 
 // ============================================================
@@ -183,25 +218,25 @@ async function runNightlyDigest() {
   // Regime change detection
   if (signalIndex?.regime && state.lastRegime && state.lastRegime !== signalIndex.regime) {
     const change = buildRegimeChange(state.lastRegime, signalIndex.regime);
-    await postToDiscord(DISCORD_WEBHOOK_URL, change, 'regime-change');
+    await postToDiscord(route('macro'), change, 'regime-change');
   }
   if (signalIndex?.regime) state.lastRegime = signalIndex.regime;
 
   // 1) Main digest
   const digest = buildDailyDigest(signalIndex, scored, calendar, darkpool, WATCHLIST);
-  await postToDiscord(DISCORD_WEBHOOK_URL, digest, 'nightly-digest');
+  await postToDiscord(route('signals'), digest, 'nightly-digest');
 
   // 2) Tier 3 alerts (separate channel if configured)
   const tier3 = scored.filter(s => Number(s.alert_tier ?? s.tier) === 3);
   if (tier3.length > 0) {
     const alert = buildTier3Alert(scored);
-    if (alert) await postToDiscord(DISCORD_ALERTS_WEBHOOK_URL, alert, 'tier3-alert');
+    if (alert) await postToDiscord(route('micro'), alert, 'tier3-alert');
   }
 
   // 3) Watchlist summary
   if (screener) {
     const wl = buildWatchlistSummary(screener, WATCHLIST);
-    if (wl) await postToDiscord(DISCORD_WEBHOOK_URL, wl, 'watchlist-summary');
+    if (wl) await postToDiscord(route('signals'), wl, 'watchlist-summary');
   }
 
   const ms = Date.now() - t0;
@@ -224,7 +259,7 @@ async function runMiddayCheck() {
       return;
     }
     const alert = buildTier3Alert(scored);
-    if (alert) await postToDiscord(DISCORD_ALERTS_WEBHOOK_URL, alert, 'midday-tier3');
+    if (alert) await postToDiscord(route('micro'), alert, 'midday-tier3');
   } catch (err) {
     logErr(`❌ midday-check failed: ${err.message}`);
   }
@@ -253,7 +288,7 @@ async function runPremarketBrief() {
       signals: watchlistSignals,
       watchlist: WATCHLIST
     });
-    await postToDiscord(DISCORD_WEBHOOK_URL, brief, 'premarket-brief');
+    await postToDiscord(route('signals'), brief, 'premarket-brief');
   } catch (err) {
     logErr(`❌ premarket-brief failed: ${err.message}`);
   }
@@ -283,7 +318,7 @@ async function runDarkpoolCheck() {
     if (shouldAlert) {
       log(`🌊 Dark pool anomaly: ${state.lastDarkpoolAggressor || '—'} → ${agg}, buy=${buy}, sell=${sell}`);
       const alert = buildDarkPoolAlert(summary, DARKPOOL_TICKER);
-      if (alert) await postToDiscord(DISCORD_WEBHOOK_URL, alert, 'darkpool-anomaly');
+      if (alert) await postToDiscord(route('micro'), alert, 'darkpool-anomaly');
     }
     state.lastDarkpoolAggressor = agg;
   } catch (err) {
@@ -315,7 +350,7 @@ export async function lookupTicker(ticker) {
   }
 
   const payload = buildTickerAlert(t, quote, enhanced);
-  return postToDiscord(DISCORD_WEBHOOK_URL, payload, `lookup-${t}`);
+  return postToDiscord(route('lookups'), payload, `lookup-${t}`);
 }
 
 // ============================================================
@@ -371,11 +406,18 @@ async function startup() {
   log(`Watchlist (${WATCHLIST.length}): ${WATCHLIST.join(', ') || '(empty)'}`);
   log(`Dark-pool ticker: ${DARKPOOL_TICKER}`);
   log('');
+  log('Channel routing:');
+  for (const [name, url] of Object.entries(CHANNELS)) {
+    const explicit = !!process.env[`DISCORD_WEBHOOK_${name.toUpperCase()}`];
+    const status = !url ? '❌ NOT SET' : explicit ? '✅ dedicated' : '⚠️  fallback to default';
+    log(`  #${name.padEnd(9)} ${status}`);
+  }
+  log('');
   log('Scheduled jobs (America/New_York, weekdays):');
-  log(`  📊 Nightly digest      ${fmtCron(DIGEST_MINUTE, DIGEST_HOUR)}  Mon–Fri`);
-  if (ENABLE_MIDDAY_CHECK)  log(`  ☀️  Midday Tier 3 check  12:30 ET           Mon–Fri`);
-  if (ENABLE_PREMARKET)     log(`  🌅 Pre-market brief    09:00 ET           Mon–Fri`);
-  log(`  🌊 Dark pool sweep     :00/:30 9am-4pm ET   Mon–Fri`);
+  log(`  📊 Nightly digest      ${fmtCron(DIGEST_MINUTE, DIGEST_HOUR)}  Mon–Fri    → #signals + #micro (Tier 3)`);
+  if (ENABLE_MIDDAY_CHECK)  log(`  ☀️  Midday Tier 3 check  12:30 ET           Mon–Fri    → #micro`);
+  if (ENABLE_PREMARKET)     log(`  🌅 Pre-market brief    09:00 ET           Mon–Fri    → #signals`);
+  log(`  🌊 Dark pool sweep     :00/:30 9am-4pm ET   Mon–Fri    → #micro`);
   log('');
 
   // Schedule jobs
@@ -394,7 +436,7 @@ async function startup() {
   // Startup notice to Discord
   const nextDigest = `${fmtCron(DIGEST_MINUTE, DIGEST_HOUR)} (Mon–Fri)`;
   const startupPayload = buildStartupNotice(me, nextDigest, WATCHLIST.length);
-  await postToDiscord(DISCORD_WEBHOOK_URL, startupPayload, 'startup');
+  await postToDiscord(route('signals'), startupPayload, 'startup');
 
   log('Bot is running. Press Ctrl+C to stop.\n');
 }
