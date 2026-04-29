@@ -16,7 +16,8 @@ import {
   getCalendar,
   screenTickers,
   getEnhancedSignal,
-  getQuote
+  getQuote,
+  getSignal
 } from './signa-client.js';
 
 import {
@@ -27,7 +28,10 @@ import {
   buildDarkPoolAlert,
   buildRegimeChange,
   buildPremarketBrief,
-  buildStartupNotice
+  buildStartupNotice,
+  buildEarningsActionCard60,
+  buildEarningsActionCard15,
+  buildEarningsFollowUp
 } from './formatter.js';
 
 // --- Environment ---
@@ -64,12 +68,14 @@ const CHANNELS = {
   backtest: process.env.DISCORD_WEBHOOK_BACKTEST || DISCORD_WEBHOOK_URL
 };
 
+// route('signals') → returns the webhook URL for #signals.
+// Logs a warning the first time a channel falls back to the default.
 const _fallbackWarned = new Set();
 function route(channel) {
   const url = CHANNELS[channel];
   if (!url) {
     if (!_fallbackWarned.has(channel)) {
-      console.warn(`[${ts()}] ⚠️  No webhook configured for #${channel} — events will be dropped.`);
+      console.warn(`[${ts()}] ⚠️  No webhook configured for #${channel} and no DISCORD_WEBHOOK_URL fallback — events will be dropped.`);
       _fallbackWarned.add(channel);
     }
     return null;
@@ -86,8 +92,54 @@ function route(channel) {
 const state = {
   lastDarkpoolAggressor: null,
   lastRegime: null,
-  lastWebhookPostAt: new Map()
+  lastWebhookPostAt: new Map() // webhookUrl -> timestamp
 };
+
+// Earnings tracker state — resets each day at 7 PM ET (after post-market closes).
+// Per-ticker keys tracked: posted60, posted15, postedFollowup,
+//                          preGrade, preScore, preDirection, reportedAt.
+const earningsState = {
+  lastResetDay: null,
+  tickers: new Map()
+};
+
+function resetEarningsStateIfNewDay() {
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: TZ });
+  if (earningsState.lastResetDay !== today) {
+    earningsState.tickers.clear();
+    earningsState.lastResetDay = today;
+    console.log(`[${ts()}] 🔄 Earnings tracker reset for ${today}`);
+  }
+}
+
+// Map session label → assumed report time in ET.
+function reportTimeFor(timeLabel) {
+  if (timeLabel === 'pre-market')  return { hour: 8,  minute: 0 };
+  if (timeLabel === 'post-market') return { hour: 16, minute: 5 };
+  return { hour: 12, minute: 0 };
+}
+
+function minutesUntilReport(timeLabel) {
+  const t = reportTimeFor(timeLabel);
+  const now = new Date();
+  const tHHMM = now.toLocaleString('en-US', {
+    timeZone: TZ, hour12: false, hour: '2-digit', minute: '2-digit'
+  });
+  const [hh, mm] = tHHMM.split(':').map(Number);
+  const nowMin = hh * 60 + mm;
+  const reportMin = t.hour * 60 + t.minute;
+  return reportMin - nowMin;
+}
+
+function getTickerState(ticker) {
+  if (!earningsState.tickers.has(ticker)) {
+    earningsState.tickers.set(ticker, {
+      posted60: false, posted15: false, postedFollowup: false,
+      preGrade: null, preScore: null, preDirection: null, reportedAt: null
+    });
+  }
+  return earningsState.tickers.get(ticker);
+}
 
 // ============================================================
 // Logging
@@ -327,6 +379,130 @@ async function runDarkpoolCheck() {
 }
 
 // ============================================================
+// JOB 5 — Earnings Action Cards (Phase 2)
+// Runs every 5 min, 7 AM – 7 PM ET weekdays. For each watchlist ticker
+// or Grade-A pipeline ticker reporting today: post a 60-min Action Card,
+// a 15-min pulse, and a follow-up after the print completes.
+// ============================================================
+
+async function runEarningsCheck() {
+  resetEarningsStateIfNewDay();
+
+  let calendar, scored;
+  try {
+    [calendar, scored] = await Promise.all([
+      getCalendar(1),
+      getScoredSignals(200)
+    ]);
+  } catch (err) {
+    logErr(`❌ earnings-check: failed to fetch calendar/signals: ${err.message}`);
+    return;
+  }
+
+  if (!Array.isArray(scored)) scored = scored?.signals || scored?.results || [];
+
+  // Today's earnings (ET-local date)
+  const todayET = new Date().toLocaleDateString('en-CA', { timeZone: TZ });
+  const todays = (calendar?.earnings || []).filter(e => e.date === todayET);
+  if (todays.length === 0) return;
+
+  // Build candidate set: watchlist tickers + Grade A scored tickers
+  const watchSet = new Set(WATCHLIST);
+  const gradeASet = new Set(
+    scored
+      .filter(s => String(s.grade || '').toUpperCase() === 'A')
+      .map(s => String(s.ticker || '').toUpperCase())
+  );
+  const candidates = todays.filter(e => {
+    const tk = String(e.ticker || '').toUpperCase();
+    return watchSet.has(tk) || gradeASet.has(tk);
+  });
+  if (candidates.length === 0) return;
+
+  for (const earn of candidates) {
+    const ticker = String(earn.ticker || '').toUpperCase();
+    if (!ticker) continue;
+
+    const minsToReport = minutesUntilReport(earn.time);
+    const tState = getTickerState(ticker);
+
+    // === T-60 post (window: 65 to 45 min before report) ===
+    if (!tState.posted60 && minsToReport <= 65 && minsToReport >= 45) {
+      try {
+        const [actionCard, quote] = await Promise.all([
+          getSignal(ticker).catch(() => null),
+          getQuote(ticker).catch(() => null)
+        ]);
+        const payload = buildEarningsActionCard60(ticker, actionCard, earn, quote);
+        const ok = await postToDiscord(route('earnings'), payload, `earnings-T60-${ticker}`);
+        if (ok) {
+          tState.posted60 = true;
+          // Cache the pre-earnings grade for the follow-up post.
+          const d = (actionCard?.data ?? actionCard?.action_card ?? actionCard?.signal ?? actionCard) || {};
+          tState.preGrade = String(d.grade ?? d.letter_grade ?? '?').toUpperCase();
+          tState.preScore = d.score ?? d.composite_score ?? null;
+          tState.preDirection = String(d.direction ?? d.bias ?? d.action ?? 'NEUTRAL').toUpperCase();
+        }
+      } catch (err) {
+        logErr(`❌ earnings T-60 failed for ${ticker}: ${err.message}`);
+      }
+    }
+
+    // === T-15 pulse (window: 20 to 5 min before report) ===
+    if (tState.posted60 && !tState.posted15 && minsToReport <= 20 && minsToReport >= 5) {
+      try {
+        const [actionCard, quote] = await Promise.all([
+          getSignal(ticker).catch(() => null),
+          getQuote(ticker).catch(() => null)
+        ]);
+        const payload = buildEarningsActionCard15(ticker, actionCard, earn, quote, tState.preGrade);
+        const ok = await postToDiscord(route('earnings'), payload, `earnings-T15-${ticker}`);
+        if (ok) tState.posted15 = true;
+      } catch (err) {
+        logErr(`❌ earnings T-15 failed for ${ticker}: ${err.message}`);
+      }
+    }
+
+    // === Mark report time once we cross zero ===
+    if (tState.posted60 && tState.reportedAt == null && minsToReport <= 0) {
+      tState.reportedAt = Date.now();
+    }
+
+    // === Follow-up (90 min after report, only if pre-grade was A) ===
+    if (
+      tState.reportedAt != null &&
+      !tState.postedFollowup &&
+      tState.preGrade?.startsWith('A') &&
+      Date.now() - tState.reportedAt >= 90 * 60 * 1000
+    ) {
+      try {
+        const quote = await getQuote(ticker).catch(() => null);
+        if (!quote || quote.change_pct == null) {
+          logErr(`⏭️  earnings follow-up: ${ticker} no quote yet, will retry next tick`);
+          continue;
+        }
+        const payload = buildEarningsFollowUp(
+          ticker,
+          tState.preGrade,
+          tState.preScore,
+          tState.preDirection,
+          quote,
+          earn
+        );
+        if (payload) {
+          const ok = await postToDiscord(route('earnings'), payload, `earnings-followup-${ticker}`);
+          if (ok) tState.postedFollowup = true;
+        } else {
+          tState.postedFollowup = true; // skip if no useful payload
+        }
+      } catch (err) {
+        logErr(`❌ earnings follow-up failed for ${ticker}: ${err.message}`);
+      }
+    }
+  }
+}
+
+// ============================================================
 // On-demand: lookupTicker (exported for slash-command use)
 // ============================================================
 
@@ -418,6 +594,7 @@ async function startup() {
   if (ENABLE_MIDDAY_CHECK)  log(`  ☀️  Midday Tier 3 check  12:30 ET           Mon–Fri    → #micro`);
   if (ENABLE_PREMARKET)     log(`  🌅 Pre-market brief    09:00 ET           Mon–Fri    → #signals`);
   log(`  🌊 Dark pool sweep     :00/:30 9am-4pm ET   Mon–Fri    → #micro`);
+  log(`  📊 Earnings tracker    every 5 min 7am-7pm  Mon–Fri    → #earnings`);
   log('');
 
   // Schedule jobs
@@ -432,6 +609,9 @@ async function startup() {
   }
 
   cron.schedule('*/30 9-16 * * 1-5', runDarkpoolCheck, { timezone: TZ });
+
+  // Earnings tracker — every 5 min, 7 AM – 7 PM ET, weekdays.
+  cron.schedule('*/5 7-19 * * 1-5', runEarningsCheck, { timezone: TZ });
 
   // Startup notice to Discord
   const nextDigest = `${fmtCron(DIGEST_MINUTE, DIGEST_HOUR)} (Mon–Fri)`;
@@ -464,6 +644,7 @@ process.on('uncaughtException', (err) => {
 //   node bot.js --premarket-now   → fire one pre-market brief, exit
 //   node bot.js --darkpool-now    → fire one dark-pool check, exit
 //   node bot.js --tier3-now       → fire one tier-3 sweep, exit
+//   node bot.js --earnings-now    → fire one earnings check, exit
 // ============================================================
 
 const cliArgs = process.argv.slice(2);
@@ -489,6 +670,8 @@ if (cliArgs.includes('--digest-now')) {
   runOneShot('Dark pool check', runDarkpoolCheck);
 } else if (cliArgs.includes('--tier3-now')) {
   runOneShot('Tier-3 sweep', runMiddayCheck);
+} else if (cliArgs.includes('--earnings-now')) {
+  runOneShot('Earnings check', runEarningsCheck);
 } else {
   // Normal run — start scheduled bot
   startup().catch(err => {

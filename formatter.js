@@ -143,7 +143,10 @@ export function buildDailyDigest(signalIndex, scoredSignals, calendar, darkpoolD
                     : regime === 'RISK_OFF' ? '🔴 RISK_OFF'
                     : '🟡 TRANSITIONAL';
 
-  const sentimentLabel = sentiment ? ` _(${sentiment})_` : '';
+  // If the API gave us a sentiment label (greed/fear/neutral), include it.
+  const sentimentLabel = sentiment
+    ? ` _(${sentiment})_`
+    : '';
 
   const description = [
     `**Regime:** ${regimeBadge}${sentimentLabel}   **Signal Index:** \`${idxScore}/100\`   **Bull Bias:** \`${bullBias}\``,
@@ -155,7 +158,9 @@ export function buildDailyDigest(signalIndex, scoredSignals, calendar, darkpoolD
 
   const fields = [];
 
-  // Top signals from /signal-index — high-conviction picks across the full pipeline.
+  // Top signals from the index endpoint (these are the conviction picks across
+  // the whole 30+ model pipeline — worth surfacing even if they're not in
+  // the scored array we got from /signals/run).
   const indexTop = (signalIndex?.top_signals || []).slice(0, 5);
   if (indexTop.length > 0) {
     fields.push({
@@ -221,14 +226,18 @@ export function buildDailyDigest(signalIndex, scoredSignals, calendar, darkpoolD
       .toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
     const dayAfterET = new Date(Date.now() + 48 * 60 * 60 * 1000)
       .toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+
     const window = new Set([todayET, tomorrowET, dayAfterET]);
     const upcoming = calendar.earnings.filter(e => window.has(e.date));
+
     const watchSet = new Set((watchlist || []).map(t => String(t).toUpperCase()));
     const watchHits = upcoming.filter(e => watchSet.has(e.ticker.toUpperCase()));
     const others = upcoming
       .filter(e => !watchSet.has(e.ticker.toUpperCase()))
       .sort((a, b) => Math.abs(Number(b.epsEstimate) || 0) - Math.abs(Number(a.epsEstimate) || 0));
+
     const display = [...watchHits, ...others].slice(0, 5);
+
     if (display.length > 0) {
       const moreCount = upcoming.length - display.length;
       fields.push({
@@ -532,6 +541,7 @@ export function buildRegimeChange(oldRegime, newRegime) {
 // ============================================================
 
 export function buildPremarketBrief(earnings, watchlistSignals) {
+  // Use ET-local date, not UTC, so this still works around midnight UTC.
   const todayET = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
   const todays = (earnings?.earnings || earnings || []).filter(e => e.date === todayET);
   const watchSet = new Set((watchlistSignals?.watchlist || []).map(t => t.toUpperCase()));
@@ -539,7 +549,9 @@ export function buildPremarketBrief(earnings, watchlistSignals) {
   const fields = [];
 
   if (todays.length > 0) {
+    // 1) Watchlist hits FIRST — these are the ones the user actually cares about.
     const watchHits = todays.filter(e => watchSet.has(e.ticker.toUpperCase()));
+    // 2) Then the biggest names by EPS estimate magnitude (often the most-watched companies).
     const others = todays
       .filter(e => !watchSet.has(e.ticker.toUpperCase()))
       .sort((a, b) => Math.abs(Number(b.epsEstimate) || 0) - Math.abs(Number(a.epsEstimate) || 0))
@@ -595,6 +607,240 @@ export function buildPremarketBrief(earnings, watchlistSignals) {
     timestamp: new Date().toISOString()
   };
 
+  return { embeds: fitMessage([embed]) };
+}
+
+// ============================================================
+// Earnings Action Cards (Phase 2)
+// ============================================================
+
+// Internal: extract drivers from a /api/v1/signal Action Card response.
+// Signa's response shape varies — we normalize across common field names.
+function extractActionCardData(actionCard) {
+  if (!actionCard) return null;
+  const d = actionCard.data ?? actionCard.action_card ?? actionCard.signal ?? actionCard;
+
+  const grade = String(d.grade ?? d.letter_grade ?? d.actionCardGrade ?? '?').toUpperCase();
+  const score = d.score ?? d.composite_score ?? d.confidence_score;
+  const direction = String(d.direction ?? d.bias ?? d.action ?? '').toUpperCase();
+  const tier = d.tier ?? d.alert_tier;
+
+  // Drivers can be: drivers[], indicators[], signals[], reasons[], triggers[]
+  const driverList = d.drivers ?? d.indicators ?? d.bullish_drivers ?? d.signals ?? [];
+  const bullishDrivers = Array.isArray(driverList)
+    ? driverList.filter(x => {
+        const dir = String(x.direction || x.signal || x.side || '').toLowerCase();
+        return dir.includes('bull') || dir.includes('buy') || x.value === true || x.bullish === true;
+      })
+    : [];
+  const bearishDrivers = Array.isArray(driverList)
+    ? driverList.filter(x => {
+        const dir = String(x.direction || x.signal || x.side || '').toLowerCase();
+        return dir.includes('bear') || dir.includes('sell') || x.bearish === true;
+      })
+    : [];
+
+  // Fallback to reasons/triggers if no structured drivers
+  const reasons = d.key_drivers ?? d.reasons ?? d.triggers ?? [];
+
+  return {
+    grade,
+    score: score != null ? Math.round(Number(score)) : null,
+    direction: direction || (grade === 'A' || grade === 'A+' || grade === 'B' ? 'BULLISH' : 'NEUTRAL'),
+    tier,
+    bullishDrivers: bullishDrivers.slice(0, 5),
+    bearishDrivers: bearishDrivers.slice(0, 3),
+    reasons: Array.isArray(reasons) ? reasons.slice(0, 5) : [],
+    entry: d.entry_price ?? d.entry,
+    stop: d.stop_level ?? d.stop_loss ?? d.stop,
+    target: d.target_price ?? d.take_profit ?? d.target,
+    sizeMultiplier: d.regime_multiplier ?? d.size_multiplier,
+    suggestedSize: d.suggested_size_pct ?? d.position_size_pct,
+    regime: d.regime,
+    confidence: d.confidence,
+    totalDrivers: Array.isArray(driverList) ? driverList.length : null,
+    bullishCount: bullishDrivers.length,
+    bearishCount: bearishDrivers.length
+  };
+}
+
+function formatDriver(drv) {
+  if (typeof drv === 'string') return trunc(drv, 90);
+  const name = drv.name ?? drv.indicator ?? drv.driver ?? drv.label ?? '';
+  const value = drv.value ?? drv.note ?? drv.detail ?? '';
+  if (name && value) return `${trunc(name, 30)} — ${trunc(String(value), 60)}`;
+  return trunc(name || JSON.stringify(drv), 90);
+}
+
+// 60-min full Action Card
+export function buildEarningsActionCard60(ticker, actionCard, earnings, quote) {
+  const data = extractActionCardData(actionCard);
+  if (!data) {
+    return buildEarningsFallback(ticker, earnings, quote, 60);
+  }
+  const dir = data.direction;
+  const color = DIR_COLOR[dir] ?? DIR_COLOR.NEUTRAL;
+  const dEmoji = DIR_EMOJI[dir] || '·';
+  const gEmoji = GRADE_EMOJI[data.grade?.[0]] || '·'; // first letter for A+/A/B
+  const epsEst = earnings?.epsEstimate != null ? `$${Number(earnings.epsEstimate).toFixed(2)}` : '—';
+  const reportTime = earnings?.time === 'pre-market' ? '🌅 Pre-market'
+                    : earnings?.time === 'post-market' ? '🌙 Post-market'
+                    : '·';
+  const price = quote?.price != null ? fmtPrice(quote.price) : null;
+  const change = quote?.change_pct != null
+    ? (Number(quote.change_pct) >= 0 ? `+${Number(quote.change_pct).toFixed(2)}%` : `${Number(quote.change_pct).toFixed(2)}%`)
+    : null;
+
+  const headerLines = [
+    `**Reports in:** ~60 min  ·  **Session:** ${reportTime}  ·  **EPS Est:** \`${epsEst}\``,
+    `${gEmoji} **Grade ${data.grade}**  ·  Score \`${data.score ?? '—'}/100\`  ·  ${dEmoji} **${dir}**`,
+    price ? `**Last:** ${price}${change ? ` (${change})` : ''}` : null,
+    data.totalDrivers
+      ? `**Driver consensus:** ${data.bullishCount}/${data.totalDrivers} bullish · ${data.bearishCount}/${data.totalDrivers} bearish`
+      : null,
+    data.regime && data.regime !== 'RISK_ON'
+      ? `⚠️  Regime: **${data.regime}**${data.sizeMultiplier && data.sizeMultiplier < 1 ? ` (size × ${data.sizeMultiplier})` : ''}`
+      : data.regime ? `**Regime:** ${data.regime}` : null
+  ].filter(Boolean);
+
+  const fields = [];
+
+  // Top bullish drivers
+  if (data.bullishDrivers.length > 0) {
+    fields.push({
+      name: '✅ Top Bullish Drivers',
+      value: data.bullishDrivers.map((d, i) => `${i + 1}. ${formatDriver(d)}`).join('\n'),
+      inline: false
+    });
+  } else if (data.reasons.length > 0) {
+    fields.push({
+      name: '✅ Key Drivers',
+      value: data.reasons.map((r, i) => `${i + 1}. ${trunc(r, 90)}`).join('\n'),
+      inline: false
+    });
+  }
+
+  // Bearish drivers (risks)
+  if (data.bearishDrivers.length > 0) {
+    fields.push({
+      name: '⚠️  Counter-signals',
+      value: data.bearishDrivers.map((d, i) => `${i + 1}. ${formatDriver(d)}`).join('\n'),
+      inline: false
+    });
+  }
+
+  // Position guide
+  const posLines = [];
+  if (data.entry != null) posLines.push(`Entry \`${fmtPrice(data.entry)}\``);
+  if (data.stop != null)  posLines.push(`Stop \`${fmtPrice(data.stop)}\``);
+  if (data.target != null) posLines.push(`Target \`${fmtPrice(data.target)}\``);
+  if (data.suggestedSize != null && data.suggestedSize > 0) posLines.push(`Size \`${data.suggestedSize}%\``);
+  if (posLines.length > 0) {
+    fields.push({
+      name: '📍 Position Guide',
+      value: posLines.join('  ·  '),
+      inline: false
+    });
+  }
+
+  const embed = {
+    title: `📊 ${ticker} — Earnings Action Card (T-60min)`,
+    description: headerLines.join('\n'),
+    color,
+    fields,
+    footer: FOOTER,
+    timestamp: new Date().toISOString()
+  };
+
+  return { embeds: fitMessage([embed]) };
+}
+
+// 15-min short pulse
+export function buildEarningsActionCard15(ticker, actionCard, earnings, quote, prevGrade) {
+  const data = extractActionCardData(actionCard);
+  const grade = data?.grade ?? prevGrade ?? '?';
+  const dir = data?.direction || 'NEUTRAL';
+  const color = DIR_COLOR[dir] ?? DIR_COLOR.NEUTRAL;
+  const gEmoji = GRADE_EMOJI[grade?.[0]] || '·';
+  const dEmoji = DIR_EMOJI[dir] || '·';
+  const epsEst = earnings?.epsEstimate != null ? `$${Number(earnings.epsEstimate).toFixed(2)}` : '—';
+  const price = quote?.price != null ? fmtPrice(quote.price) : '—';
+  const change = quote?.change_pct != null
+    ? (Number(quote.change_pct) >= 0 ? `+${Number(quote.change_pct).toFixed(2)}%` : `${Number(quote.change_pct).toFixed(2)}%`)
+    : null;
+
+  const gradeChange = prevGrade && data?.grade && prevGrade !== data.grade
+    ? `  _(was ${prevGrade} at T-60)_`
+    : '';
+
+  const description = [
+    `⏰ **Reports in ~15 min** · EPS Est \`${epsEst}\``,
+    `${gEmoji} Grade **${grade}**${gradeChange}  ·  ${dEmoji} **${dir}**  ·  Score \`${data?.score ?? '—'}\``,
+    `Last: **${price}**${change ? ` (${change})` : ''}`
+  ].join('\n');
+
+  const embed = {
+    title: `⚡ ${ticker} — T-15min Pulse`,
+    description,
+    color,
+    footer: FOOTER,
+    timestamp: new Date().toISOString()
+  };
+  return { embeds: fitMessage([embed]) };
+}
+
+// Follow-up after earnings: pre-grade vs price reaction
+export function buildEarningsFollowUp(ticker, preEarningsGrade, preEarningsScore, preEarningsDirection, quote, earnings) {
+  if (!quote || quote.change_pct == null) return null;
+  const changePct = Number(quote.change_pct);
+  const reaction = changePct >= 1 ? 'BEAT (price up)'
+                 : changePct <= -1 ? 'MISS (price down)'
+                 : 'INLINE';
+  const validated = (preEarningsDirection === 'BULLISH' && changePct >= 1)
+                  || (preEarningsDirection === 'BEARISH' && changePct <= -1);
+  const verdict = validated
+    ? `✅ **Signa called it** — pre-grade ${preEarningsGrade} ${preEarningsDirection} → ${reaction}`
+    : `❌ **Signa missed** — pre-grade ${preEarningsGrade} ${preEarningsDirection} → ${reaction}`;
+
+  const color = validated ? 0x00FF88 : 0xFF4444;
+  const gEmoji = GRADE_EMOJI[preEarningsGrade?.[0]] || '·';
+  const epsEst = earnings?.epsEstimate != null ? `$${Number(earnings.epsEstimate).toFixed(2)}` : '—';
+
+  const description = [
+    `**Pre-earnings:** ${gEmoji} Grade ${preEarningsGrade} · Score \`${preEarningsScore ?? '—'}\` · **${preEarningsDirection}**`,
+    `**EPS Est:** \`${epsEst}\``,
+    `**Price reaction:** ${changePct >= 0 ? '+' : ''}${changePct.toFixed(2)}% → ${fmtPrice(quote.price)}`,
+    '',
+    verdict
+  ].join('\n');
+
+  const embed = {
+    title: `🔔 ${ticker} — Earnings Follow-Up`,
+    description,
+    color,
+    footer: FOOTER,
+    timestamp: new Date().toISOString()
+  };
+  return { embeds: fitMessage([embed]) };
+}
+
+// Fallback if Signa's Action Card endpoint fails for a ticker
+function buildEarningsFallback(ticker, earnings, quote, minutesBefore) {
+  const epsEst = earnings?.epsEstimate != null ? `$${Number(earnings.epsEstimate).toFixed(2)}` : '—';
+  const reportTime = earnings?.time === 'pre-market' ? '🌅 Pre-market'
+                    : earnings?.time === 'post-market' ? '🌙 Post-market' : '·';
+  const price = quote?.price != null ? fmtPrice(quote.price) : '—';
+  const description = [
+    `⚠️  Action Card data unavailable from Signa for ${ticker}.`,
+    `**Reports in ~${minutesBefore} min** · ${reportTime} · EPS Est \`${epsEst}\` · Last \`${price}\``
+  ].join('\n');
+  const embed = {
+    title: `📊 ${ticker} — Earnings (T-${minutesBefore}min, partial)`,
+    description,
+    color: 0xFFCC00,
+    footer: FOOTER,
+    timestamp: new Date().toISOString()
+  };
   return { embeds: fitMessage([embed]) };
 }
 
