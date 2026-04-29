@@ -1025,7 +1025,7 @@ export function buildBacktestResult(symbol, backtest, opts = {}) {
 
   // Build header
   const headerLines = [
-    `**Strategy:** Signa signals + ${fmtNum(cfg.stopLoss * 100, 0)}% stop / ${fmtNum(cfg.takeProfit * 100, 0)}% target / ${cfg.holdingPeriod || '?'}d max hold`,
+    `**Strategy:** Signa signals + ${fmtNum(cfg.stopLoss * 100, 0)}% stop / ${fmtNum(cfg.takeProfit * 100, 0)}% target / ${cfg.holdingPeriod}d max hold`,
     `**Window:** \`${(cfg.startDate || '').slice(0, 10)}\` → \`${(cfg.endDate || '').slice(0, 10)}\` (${s.totalDays || '?'} days)`,
     `**Capital:** ${fmtMoney(cfg.initialCapital)}  ·  **Position size:** ${fmtNum(cfg.positionSize * 100, 0)}%`
   ];
@@ -1120,6 +1120,184 @@ export function buildBacktestResult(symbol, backtest, opts = {}) {
   };
 
   return { embeds: fitMessage([embed]) };
+}
+
+// ============================================================
+// Multi-LLM Consensus Alert (Phase 2 Feature 4)
+//
+// Fires when:
+//   - The multi-llm-consensus agent shows BULLISH or BEARISH (not NEUTRAL)
+//   - AND at least 2 other (non-LLM) agents agree on direction
+//
+// Highlights which 3 LLMs are aligned (Claude/GPT/Gemini) plus the
+// confirming technical agents. Treats this as the highest-conviction
+// signal Signa generates.
+// ============================================================
+
+// Friendly-name mapping for agent IDs commonly returned by the feed.
+const LLM_FRIENDLY_NAMES = {
+  'claude': 'Claude',
+  'claude-4': 'Claude',
+  'claude-4-7': 'Claude 4.7',
+  'claude-sonnet': 'Claude Sonnet',
+  'claude-opus': 'Claude Opus',
+  'gpt-4': 'GPT-4',
+  'gpt-4o': 'GPT-4o',
+  'openai': 'GPT-4o',
+  'gpt': 'GPT-4',
+  'gemini': 'Gemini',
+  'gemini-2-5-pro': 'Gemini 2.5 Pro',
+  'gemini-pro': 'Gemini Pro'
+};
+
+function llmFriendlyName(agent) {
+  const id = String(agent.model_id || agent.modelId || agent.agent_id || agent.agentId || agent.name || '').toLowerCase();
+  for (const key in LLM_FRIENDLY_NAMES) {
+    if (id.includes(key)) return LLM_FRIENDLY_NAMES[key];
+  }
+  return agent.model_name || agent.modelName || id || 'LLM';
+}
+
+function technicalAgentName(agent) {
+  const raw = agent.model_name || agent.modelName
+    || (agent.model_id || agent.modelId || agent.agent_id || agent.agentId || '');
+  if (!raw) return 'Unknown';
+  return String(raw)
+    .replace(/[-_]/g, ' ')
+    .replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function confidencePct(agent) {
+  const c = agent.confidence;
+  if (c == null) return null;
+  return Math.round(c <= 1 ? c * 100 : c);
+}
+
+export function buildLLMConsensusAlert(ticker, llmConsensusSignal, agreeingAgents, opts = {}) {
+  if (!ticker || !llmConsensusSignal) return null;
+
+  const dir = String(
+    llmConsensusSignal.signal || llmConsensusSignal.direction || ''
+  ).toUpperCase();
+  const isBull = /BULL|LONG|BUY/.test(dir);
+  const isBear = /BEAR|SHORT|SELL/.test(dir);
+  if (!isBull && !isBear) return null; // Skip NEUTRAL
+
+  const directionLabel = isBull ? 'BULLISH' : 'BEARISH';
+  const dEmoji = isBull ? '🟢' : '🔴';
+  const color = isBull ? 0x00FF88 : 0xFF4444;
+
+  const llmAgents = (opts.llmAgents || []).filter(a => {
+    const sig = String(a.signal || a.direction || '').toUpperCase();
+    return isBull ? /BULL|LONG|BUY/.test(sig) : /BEAR|SHORT|SELL/.test(sig);
+  });
+
+  const techAgents = (agreeingAgents || []).filter(a => {
+    const id = String(a.model_id || a.modelId || a.agent_id || a.agentId || a.name || '').toLowerCase();
+    const isLLM = /llm|claude|gpt|gemini|openai/.test(id);
+    return !isLLM;
+  });
+
+  const acData = opts.actionCard || null;
+  const acGrade = acData ? String(acData.grade ?? acData.letter_grade ?? acData.signaGrade ?? '?').toUpperCase() : '?';
+  const regime = opts.regime || llmConsensusSignal.regime || 'UNKNOWN';
+
+  // Sizing per regime (mirrors Tier 3 logic)
+  const r = String(regime).toUpperCase();
+  let sizing = { mult: 0.65, label: '0.65× — TRANSITIONAL regime' };
+  if (r === 'RISK_ON') sizing = isBull
+    ? { mult: 1.0, label: 'Full size — regime favors bulls' }
+    : { mult: 0.5, label: '0.5× — regime headwind for shorts' };
+  else if (r === 'RISK_OFF') sizing = isBull
+    ? { mult: 0.35, label: '0.35× — RISK_OFF dampens longs heavily' }
+    : { mult: 1.0, label: 'Full size — regime favors shorts' };
+
+  // Header lines
+  const totalAgreeingCount = llmAgents.length + techAgents.length;
+  const headerLines = [
+    `${dEmoji} **${directionLabel}** consensus across **${llmAgents.length} LLMs** + **${techAgents.length} technical agents**`,
+    `Action Card: \`${acGrade}\`  ·  Regime: **${regime}**  ·  Sizing: ${sizing.label}`
+  ];
+
+  const fields = [];
+
+  // LLM Stack
+  if (llmAgents.length > 0) {
+    const llmLines = llmAgents.slice(0, 5).map(a => {
+      const name = llmFriendlyName(a);
+      const c = confidencePct(a);
+      return c != null ? `• **${name}** — ${c}% confidence` : `• **${name}**`;
+    });
+    fields.push({
+      name: '🤖 LLM Stack',
+      value: llmLines.join('\n'),
+      inline: false
+    });
+  }
+
+  // Supporting Technical Agents (top 5)
+  if (techAgents.length > 0) {
+    const techSorted = [...techAgents].sort((a, b) =>
+      (Number(b.confidence) || 0) - (Number(a.confidence) || 0)
+    ).slice(0, 5);
+    const techLines = techSorted.map((a, i) => {
+      const name = technicalAgentName(a);
+      const c = confidencePct(a);
+      return c != null ? `${i + 1}. ${name} (${c})` : `${i + 1}. ${name}`;
+    });
+    fields.push({
+      name: '📊 Supporting Technical Agents',
+      value: techLines.join('\n'),
+      inline: false
+    });
+  }
+
+  // Position guide — pull levels from action card or top tech agent
+  const acEntry = acData?.entry_price ?? acData?.entry;
+  const acStop  = acData?.stop_level ?? acData?.stop_loss ?? acData?.stop;
+  const acTarget = acData?.target_price ?? acData?.take_profit ?? acData?.target;
+
+  const topTech = techAgents[0] || null;
+  const entry  = acEntry  ?? topTech?.entry_price;
+  const stop   = acStop   ?? topTech?.stop_level;
+  const target = acTarget ?? topTech?.target_price;
+
+  const posLines = [];
+  if (entry  != null) posLines.push(`Entry \`${fmtPrice(entry)}\``);
+  if (stop   != null) posLines.push(`Stop \`${fmtPrice(stop)}\``);
+  if (target != null) posLines.push(`Target \`${fmtPrice(target)}\``);
+  posLines.push(`Size \`${Math.round(sizing.mult * 100)}%\``);
+  fields.push({
+    name: '📍 Position Guide',
+    value: posLines.join('  ·  '),
+    inline: false
+  });
+
+  // Why this matters block
+  const llmCount = llmAgents.length || 'multiple';
+  fields.push({
+    name: '💡 Why this matters',
+    value: [
+      `${llmCount} different LLMs reading the same market data independently arrived at the same conclusion.`,
+      `Combined with ${techAgents.length} technical agents agreeing, this is a high-confluence setup.`,
+      `Multi-LLM consensus + technical confirmation is among Signa's strongest signal types.`
+    ].join(' '),
+    inline: false
+  });
+
+  const embed = {
+    title: `🤖 LLM CONSENSUS — ${ticker}`,
+    description: headerLines.join('\n'),
+    color,
+    fields,
+    footer: FOOTER,
+    timestamp: new Date().toISOString()
+  };
+
+  return {
+    content: `🚨 @here LLM CONSENSUS · ${ticker} ${directionLabel}`,
+    embeds: fitMessage([embed])
+  };
 }
 
 // ============================================================

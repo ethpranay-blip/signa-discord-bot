@@ -34,7 +34,8 @@ import {
   buildEarningsActionCard60,
   buildEarningsActionCard15,
   buildEarningsFollowUp,
-  buildBacktestResult
+  buildBacktestResult,
+  buildLLMConsensusAlert
 } from './formatter.js';
 
 // --- Environment ---
@@ -658,6 +659,146 @@ export async function runBacktestForTicker(ticker, options = {}) {
 }
 
 // ============================================================
+// JOB 6 — Multi-LLM Consensus Check (Phase 2 Feature 4)
+//
+// Runs at 21:35 ET weekdays (5 min after the nightly digest).
+// Fetches the raw signal feed, finds rows from multi-llm-consensus
+// (and individual LLM agents) showing strong directional conviction,
+// then verifies that 2+ technical (non-LLM) agents agree on the same
+// ticker + direction. Emits one alert per qualifying ticker to #signals.
+// ============================================================
+
+// State: track which (ticker, direction) we've alerted on today, so a
+// ticker doesn't spam #signals if multiple cron passes happen.
+const llmAlertState = {
+  lastResetDay: null,
+  alerted: new Set() // keys like "NVDA:BULLISH"
+};
+
+function resetLLMStateIfNewDay() {
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: TZ });
+  if (llmAlertState.lastResetDay !== today) {
+    llmAlertState.alerted.clear();
+    llmAlertState.lastResetDay = today;
+    log(`🔄 LLM consensus tracker reset for ${today}`);
+  }
+}
+
+// Helper: is this signal feed row an LLM-style agent?
+function isLLMAgent(row) {
+  const id = String(
+    row.model_id || row.modelId || row.agent_id || row.agentId || row.name || ''
+  ).toLowerCase();
+  return /llm|claude|gpt|gemini|openai/.test(id);
+}
+
+// Helper: is this signal feed row the multi-llm-consensus aggregator?
+function isMultiLLMConsensus(row) {
+  const id = String(
+    row.model_id || row.modelId || row.agent_id || row.agentId || row.name || ''
+  ).toLowerCase();
+  return /multi.?llm.?consensus|consensus.?llm|llm.?consensus/.test(id);
+}
+
+function normalizedDirection(row) {
+  const sig = String(row.signal || row.direction || '').toUpperCase();
+  if (/BULL|LONG|BUY/.test(sig)) return 'BULLISH';
+  if (/BEAR|SHORT|SELL/.test(sig)) return 'BEARISH';
+  return 'NEUTRAL';
+}
+
+async function runLLMConsensusCheck(opts = {}) {
+  resetLLMStateIfNewDay();
+  log('🤖 Running multi-LLM consensus check…');
+
+  let signalFeed = [];
+  let signalIndex = null;
+  try {
+    const [feedRes, idxRes] = await Promise.allSettled([
+      getSignalFeed(300),
+      getSignalIndex()
+    ]);
+    if (feedRes.status === 'fulfilled') {
+      const f = feedRes.value;
+      signalFeed = Array.isArray(f?.signals) ? f.signals : Array.isArray(f) ? f : [];
+    } else {
+      logErr(`❌ LLM consensus: signal feed fetch failed: ${feedRes.reason?.message}`);
+      return;
+    }
+    if (idxRes.status === 'fulfilled') signalIndex = idxRes.value;
+  } catch (err) {
+    logErr(`❌ LLM consensus check failed at fetch: ${err.message}`);
+    return;
+  }
+
+  // Find multi-llm-consensus rows with directional bias
+  const consensusRows = signalFeed.filter(s =>
+    isMultiLLMConsensus(s) && normalizedDirection(s) !== 'NEUTRAL'
+  );
+
+  if (consensusRows.length === 0) {
+    log('  No multi-LLM consensus signals with directional bias.');
+    return;
+  }
+
+  log(`  Found ${consensusRows.length} multi-LLM consensus rows. Checking confluence…`);
+
+  let firedCount = 0;
+
+  for (const consensus of consensusRows) {
+    const ticker = String(consensus.ticker || '').toUpperCase();
+    if (!ticker) continue;
+
+    const dir = normalizedDirection(consensus);
+    const alertKey = `${ticker}:${dir}`;
+    if (llmAlertState.alerted.has(alertKey) && !opts.force) {
+      continue; // already alerted this combo today
+    }
+
+    // Find all rows for this ticker + matching direction
+    const tickerRows = signalFeed.filter(s => {
+      const t = String(s.ticker || '').toUpperCase();
+      return t === ticker && normalizedDirection(s) === dir;
+    });
+
+    const llmAgents = tickerRows.filter(r => isLLMAgent(r) || isMultiLLMConsensus(r));
+    const techAgents = tickerRows.filter(r => !isLLMAgent(r) && !isMultiLLMConsensus(r));
+
+    // GATE: at least 2 technical agents must also agree on direction
+    if (techAgents.length < 2) {
+      log(`    ${ticker} ${dir}: only ${techAgents.length} technical agent(s) — skipping (need 2+)`);
+      continue;
+    }
+
+    log(`    ${ticker} ${dir}: ${llmAgents.length} LLMs + ${techAgents.length} technical → firing alert`);
+
+    // Fetch Action Card for richer grade/levels
+    let actionCard = null;
+    try {
+      const card = await getSignal(ticker);
+      actionCard = card?.data ?? card?.action_card ?? card?.signal ?? card;
+    } catch (err) {
+      logErr(`    ⚠️  Action Card fetch failed for ${ticker}: ${err.message}`);
+    }
+
+    const payload = buildLLMConsensusAlert(ticker, consensus, techAgents, {
+      llmAgents,
+      actionCard,
+      regime: signalIndex?.regime
+    });
+    if (!payload) continue;
+
+    const ok = await postToDiscord(route('signals'), payload, `llm-consensus-${ticker}`);
+    if (ok) {
+      llmAlertState.alerted.add(alertKey);
+      firedCount++;
+    }
+  }
+
+  log(`✓ LLM consensus check complete. Fired ${firedCount} alert(s).`);
+}
+
+// ============================================================
 // Startup
 // ============================================================
 
@@ -723,6 +864,7 @@ async function startup() {
   if (ENABLE_PREMARKET)     log(`  🌅 Pre-market brief    09:00 ET           Mon–Fri    → #signals`);
   log(`  🌊 Dark pool sweep     :00/:30 9am-4pm ET   Mon–Fri    → #micro`);
   log(`  📊 Earnings tracker    every 5 min 7am-7pm  Mon–Fri    → #earnings`);
+  log(`  🤖 LLM consensus       21:35 ET             Mon–Fri    → #signals`);
   log('');
 
   // Schedule jobs
@@ -740,6 +882,9 @@ async function startup() {
 
   // Earnings tracker — every 5 min, 7 AM – 7 PM ET, weekdays.
   cron.schedule('*/5 7-19 * * 1-5', runEarningsCheck, { timezone: TZ });
+
+  // Multi-LLM consensus — 9:35 PM ET weekdays (5 min after nightly digest).
+  cron.schedule('35 21 * * 1-5', runLLMConsensusCheck, { timezone: TZ });
 
   // Startup notice to Discord
   const nextDigest = `${fmtCron(DIGEST_MINUTE, DIGEST_HOUR)} (Mon–Fri)`;
@@ -773,6 +918,7 @@ process.on('uncaughtException', (err) => {
 //   node bot.js --darkpool-now    → fire one dark-pool check, exit
 //   node bot.js --tier3-now       → fire one tier-3 sweep, exit
 //   node bot.js --earnings-now    → fire one earnings check, exit
+//   node bot.js --llm-now         → fire one multi-LLM consensus check, exit
 //   node bot.js --backtest TICKER [profile] → run backtest, post to #backtest, exit
 //                                  profile: swing (default) | daytrade | position
 // ============================================================
@@ -802,6 +948,8 @@ if (cliArgs.includes('--digest-now')) {
   runOneShot('Tier-3 sweep', runMiddayCheck);
 } else if (cliArgs.includes('--earnings-now')) {
   runOneShot('Earnings check', runEarningsCheck);
+} else if (cliArgs.includes('--llm-now')) {
+  runOneShot('LLM consensus check', () => runLLMConsensusCheck({ force: true }));
 } else if (cliArgs.includes('--backtest')) {
   // node bot.js --backtest NVDA [profile]
   const idx = cliArgs.indexOf('--backtest');
