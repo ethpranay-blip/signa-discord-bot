@@ -1,0 +1,19 @@
+{
+  "name": "signa-discord-bot",
+  "version": "1.0.0",
+  "description": "Discord + Web Portal integration for Signa AI Trading Intelligence (getsigna.ai)",
+  "type": "module",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "test:api": "node signa-client.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "node-cron": "^3.0.3",
+    "node-fetch": "^3.3.2",
+    "dotenv": "^16.4.5"
+  }
+}

@@ -1,0 +1,1036 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Signa Portal</title>
+<style>
+  /* ============================================================
+     SIGNA PORTAL — single-file, vanilla, no external deps
+     ============================================================ */
+  :root {
+    --bg: #0B0E11;
+    --card: rgba(18, 21, 27, 0.85);
+    --border: rgba(255, 255, 255, 0.08);
+    --border-strong: rgba(255, 255, 255, 0.16);
+    --cyan: #00F5FF;
+    --lime: #CCFF00;
+    --green: #00FF88;
+    --red: #FF4444;
+    --yellow: #FFCC00;
+    --muted: #94A3B8;
+    --text: #E5E9F0;
+    --text-strong: #F8FAFC;
+    --radius: 12px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+    background-image:
+      radial-gradient(circle at 20% 0%, rgba(0,245,255,0.05), transparent 50%),
+      radial-gradient(circle at 80% 100%, rgba(204,255,0,0.04), transparent 50%);
+  }
+  .mono { font-family: var(--mono); }
+  button { font-family: inherit; }
+
+  /* Header */
+  header {
+    position: sticky; top: 0; z-index: 50;
+    background: rgba(11, 14, 17, 0.85);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+  }
+  .header-inner {
+    max-width: 1400px; margin: 0 auto;
+    padding: 14px 20px;
+    display: flex; justify-content: space-between; align-items: center;
+    gap: 16px; flex-wrap: wrap;
+  }
+  .brand {
+    color: var(--cyan); font-weight: 700; font-size: 16px;
+    letter-spacing: 0.08em; font-family: var(--mono);
+  }
+  .header-right {
+    display: flex; align-items: center; gap: 14px;
+    color: var(--muted); font-size: 12px; font-family: var(--mono);
+  }
+  .status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--muted); display: inline-block;
+    box-shadow: 0 0 8px currentColor;
+  }
+  .status-dot.connected { background: var(--green); color: var(--green); }
+  .status-dot.error     { background: var(--red); color: var(--red); }
+  .refresh-btn {
+    background: transparent; border: 1px solid var(--border);
+    color: var(--muted); padding: 4px 10px; border-radius: 6px;
+    cursor: pointer; font-size: 12px; transition: all 0.15s;
+  }
+  .refresh-btn:hover { color: var(--cyan); border-color: var(--cyan); }
+
+  /* Main */
+  main { max-width: 1400px; margin: 0 auto; padding: 20px; }
+  .panel {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px;
+    margin-bottom: 18px;
+  }
+  .panel h2 {
+    margin: 0 0 14px 0; font-size: 14px; font-weight: 600;
+    color: var(--text-strong); letter-spacing: 0.04em; text-transform: uppercase;
+    display: flex; align-items: center; gap: 8px;
+  }
+
+  /* API key bar */
+  .keybar {
+    display: flex; gap: 10px; flex-wrap: wrap; align-items: center;
+  }
+  .keybar input {
+    flex: 1; min-width: 200px;
+    background: rgba(0,0,0,0.4); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; font-family: var(--mono); font-size: 13px;
+    outline: none; transition: border-color 0.15s;
+  }
+  .keybar input:focus { border-color: var(--cyan); }
+  .keybar button.primary {
+    background: var(--cyan); color: #001520;
+    border: 0; border-radius: 8px; padding: 10px 18px;
+    font-weight: 600; cursor: pointer; transition: filter 0.15s;
+  }
+  .keybar button.primary:hover { filter: brightness(1.1); }
+  .keybar small { width: 100%; color: var(--muted); font-size: 11px; }
+
+  /* Banner */
+  .banner {
+    padding: 10px 14px; border-radius: 8px;
+    margin-bottom: 14px; font-size: 13px;
+    border: 1px solid;
+  }
+  .banner.error  { background: rgba(255,68,68,0.08); border-color: rgba(255,68,68,0.3); color: #FFB4B4; }
+  .banner.warn   { background: rgba(255,204,0,0.08); border-color: rgba(255,204,0,0.3); color: #FFE082; }
+  .banner.info   { background: rgba(0,245,255,0.06); border-color: rgba(0,245,255,0.3); color: #B4F2FF; }
+
+  /* Stats row */
+  .stats {
+    display: grid; gap: 14px;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    margin-bottom: 18px;
+  }
+  .stat-card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 16px;
+  }
+  .stat-label {
+    font-size: 11px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.08em;
+    margin-bottom: 8px;
+  }
+  .stat-value {
+    font-size: 28px; font-weight: 700; font-family: var(--mono);
+    color: var(--text-strong); line-height: 1;
+  }
+  .stat-value.green  { color: var(--green); }
+  .stat-value.yellow { color: var(--yellow); }
+  .stat-value.red    { color: var(--red); }
+  .stat-value.muted  { color: var(--muted); }
+  .stat-sub { font-size: 11px; color: var(--muted); margin-top: 4px; font-family: var(--mono); }
+
+  .badge {
+    display: inline-block; padding: 4px 10px; border-radius: 6px;
+    font-size: 12px; font-weight: 600; letter-spacing: 0.05em;
+    text-transform: uppercase; font-family: var(--mono);
+  }
+  .badge.green  { background: rgba(0,255,136,0.12); color: var(--green); border: 1px solid rgba(0,255,136,0.3); }
+  .badge.yellow { background: rgba(255,204,0,0.12); color: var(--yellow); border: 1px solid rgba(255,204,0,0.3); }
+  .badge.red    { background: rgba(255,68,68,0.12); color: var(--red); border: 1px solid rgba(255,68,68,0.3); }
+
+  /* Filters */
+  .filters {
+    display: flex; flex-wrap: wrap; gap: 16px;
+    align-items: center;
+  }
+  .filter-group {
+    display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+  }
+  .filter-group span {
+    font-size: 11px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.06em;
+    margin-right: 6px;
+  }
+  .pill {
+    background: transparent; color: var(--muted);
+    border: 1px solid var(--border); border-radius: 999px;
+    padding: 5px 12px; font-size: 12px; cursor: pointer;
+    font-family: var(--mono); transition: all 0.15s;
+  }
+  .pill:hover { color: var(--text-strong); border-color: var(--border-strong); }
+  .pill.active { background: var(--cyan); color: #001520; border-color: var(--cyan); }
+
+  /* Signal grid */
+  .signal-grid {
+    display: grid; gap: 14px;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  }
+  .signal-card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 16px;
+    transition: all 0.18s; position: relative;
+  }
+  .signal-card.bullish:hover { border-color: var(--green); box-shadow: 0 0 0 1px var(--green); }
+  .signal-card.bearish:hover { border-color: var(--red); box-shadow: 0 0 0 1px var(--red); }
+
+  .signal-top {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 10px; gap: 8px; flex-wrap: wrap;
+  }
+  .signal-ticker {
+    font-family: var(--mono); font-size: 22px; font-weight: 700;
+    color: var(--text-strong); letter-spacing: 0.02em;
+  }
+  .signal-badges { display: flex; gap: 4px; flex-wrap: wrap; }
+  .mini-badge {
+    padding: 2px 7px; border-radius: 4px;
+    font-size: 10px; font-family: var(--mono); font-weight: 700;
+    letter-spacing: 0.05em;
+  }
+  .dir-bullish { background: rgba(0,255,136,0.15); color: var(--green); }
+  .dir-bearish { background: rgba(255,68,68,0.15); color: var(--red); }
+  .dir-neutral { background: rgba(255,204,0,0.15); color: var(--yellow); }
+  .grade-A { background: rgba(0,255,136,0.15); color: var(--green); }
+  .grade-B { background: rgba(0,245,255,0.15); color: var(--cyan); }
+  .grade-C { background: rgba(255,204,0,0.15); color: var(--yellow); }
+  .grade-D, .grade-F { background: rgba(255,68,68,0.15); color: var(--red); }
+  .tier-1 { background: rgba(148,163,184,0.15); color: var(--muted); }
+  .tier-2 { background: rgba(255,204,0,0.15); color: var(--yellow); }
+  .tier-3 { background: rgba(255,68,68,0.2); color: var(--red); }
+
+  .score-bar {
+    height: 6px; background: rgba(255,255,255,0.06); border-radius: 3px;
+    margin: 10px 0 6px 0; overflow: hidden;
+  }
+  .score-fill {
+    height: 100%; border-radius: 3px;
+    background: linear-gradient(90deg, var(--cyan), var(--green));
+    transition: width 0.4s;
+  }
+  .score-meta {
+    display: flex; justify-content: space-between;
+    font-size: 11px; color: var(--muted); font-family: var(--mono);
+    margin-bottom: 10px;
+  }
+  .signal-driver {
+    font-size: 12px; color: var(--text);
+    margin-bottom: 6px; line-height: 1.45;
+  }
+  .signal-driver::before { content: "▸ "; color: var(--cyan); }
+  .signal-position {
+    margin-top: 10px; padding-top: 10px;
+    border-top: 1px solid var(--border);
+    display: flex; gap: 12px; flex-wrap: wrap;
+    font-family: var(--mono); font-size: 11px;
+  }
+  .pos-item { color: var(--muted); }
+  .pos-item b { color: var(--text); font-weight: 600; }
+  .signal-model {
+    margin-top: 6px; font-size: 10px; color: var(--muted);
+    font-family: var(--mono); letter-spacing: 0.04em;
+  }
+
+  /* Watchlist */
+  .watchlist-input-row {
+    display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px;
+  }
+  .watchlist-input-row textarea {
+    flex: 1; min-width: 200px;
+    background: rgba(0,0,0,0.4); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; font-family: var(--mono); font-size: 12px;
+    outline: none; resize: vertical; min-height: 44px;
+  }
+  .watchlist-input-row textarea:focus { border-color: var(--cyan); }
+  .watchlist-input-row button {
+    background: var(--lime); color: #1a1f00;
+    border: 0; border-radius: 8px; padding: 10px 16px;
+    font-weight: 600; cursor: pointer; font-size: 13px;
+  }
+  .watchlist-input-row button.secondary {
+    background: transparent; color: var(--muted);
+    border: 1px solid var(--border);
+  }
+
+  /* Tables */
+  .table {
+    width: 100%; border-collapse: collapse;
+    font-size: 12px;
+  }
+  .table th, .table td {
+    padding: 8px 10px; text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+  .table th {
+    color: var(--muted); font-weight: 500;
+    text-transform: uppercase; letter-spacing: 0.06em; font-size: 11px;
+  }
+  .table td.mono { font-family: var(--mono); }
+  .table tr:hover td { background: rgba(255,255,255,0.02); }
+
+  /* Dark pool */
+  .dp-row {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 14px;
+    margin-bottom: 12px;
+  }
+  .dp-row > div { padding: 12px; background: rgba(0,0,0,0.25); border-radius: 8px; }
+  .dp-label { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+  .dp-val { font-family: var(--mono); font-size: 18px; font-weight: 700; color: var(--text-strong); }
+  .dp-bar-row {
+    display: flex; align-items: center; gap: 8px;
+    margin: 12px 0;
+  }
+  .dp-bar { flex: 1; height: 24px; background: rgba(0,0,0,0.4); border-radius: 6px; overflow: hidden; display: flex; }
+  .dp-bar-buy  { background: var(--green); display: flex; align-items: center; justify-content: center; font-size: 11px; color: #002200; font-weight: 700; font-family: var(--mono); }
+  .dp-bar-sell { background: var(--red);   display: flex; align-items: center; justify-content: center; font-size: 11px; color: #220000; font-weight: 700; font-family: var(--mono); }
+
+  /* Loading skeleton */
+  .skel {
+    background: linear-gradient(90deg, rgba(255,255,255,0.04), rgba(255,255,255,0.08), rgba(255,255,255,0.04));
+    background-size: 200% 100%;
+    animation: skel 1.5s ease-in-out infinite;
+    border-radius: 6px;
+    height: 14px;
+  }
+  @keyframes skel {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+  }
+  .skel-card { padding: 16px; }
+  .skel-line { height: 14px; margin-bottom: 8px; }
+  .skel-line.short { width: 50%; }
+  .skel-line.medium { width: 75%; }
+
+  /* Empty */
+  .empty {
+    text-align: center; padding: 32px 16px;
+    color: var(--muted); font-size: 13px;
+  }
+
+  /* Stale */
+  .stale-tag {
+    color: var(--yellow); font-size: 10px; font-family: var(--mono);
+    margin-left: 8px; letter-spacing: 0.05em;
+  }
+
+  /* Mobile */
+  @media (max-width: 600px) {
+    main { padding: 12px; }
+    .panel { padding: 14px; }
+    .header-inner { padding: 12px 14px; }
+    .signal-grid { grid-template-columns: 1fr; }
+    .dp-row { grid-template-columns: 1fr; }
+    .stat-value { font-size: 22px; }
+  }
+  @media (max-width: 380px) {
+    .header-right { font-size: 11px; gap: 8px; }
+    .brand { font-size: 14px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-inner">
+    <div class="brand">◆ SIGNA PORTAL</div>
+    <div class="header-right">
+      <span class="status-dot" id="statusDot" title="Connection status"></span>
+      <span id="lastUpdate">never</span>
+      <span id="countdown"></span>
+      <button class="refresh-btn" id="refreshBtn">↻ Refresh</button>
+    </div>
+  </div>
+</header>
+
+<main>
+
+  <!-- API key bar -->
+  <section class="panel" id="keyPanel">
+    <h2>🔐 Connect</h2>
+    <div class="keybar">
+      <input type="password" id="apiKeyInput" placeholder="Paste your Signa API key (cmts_…)" autocomplete="off">
+      <button class="primary" id="connectBtn">Connect</button>
+      <small>Your key is stored only in this browser's localStorage. It is never sent anywhere except app.getsigna.ai. Get a key at app.getsigna.ai/dashboard/api-keys</small>
+    </div>
+    <div id="keyError"></div>
+  </section>
+
+  <!-- Banner area -->
+  <div id="bannerArea"></div>
+
+  <!-- Stats row -->
+  <div class="stats" id="statsRow">
+    <div class="stat-card"><div class="stat-label">Signal Index</div><div class="stat-value muted" id="statIdx">—</div><div class="stat-sub" id="statIdxSub">connect to load</div></div>
+    <div class="stat-card"><div class="stat-label">Regime</div><div class="stat-value muted" id="statRegime">—</div><div class="stat-sub">market state</div></div>
+    <div class="stat-card"><div class="stat-label">Total Signals</div><div class="stat-value muted" id="statTotal">—</div><div class="stat-sub" id="statTotalSub">—</div></div>
+    <div class="stat-card"><div class="stat-label">Bull / Bear</div><div class="stat-value muted" id="statBullBear">—</div><div class="stat-sub" id="statBullBearSub">—</div></div>
+    <div class="stat-card"><div class="stat-label">Tier 3</div><div class="stat-value muted" id="statT3">—</div><div class="stat-sub">high conviction</div></div>
+  </div>
+
+  <!-- Signals filters + grid -->
+  <section class="panel" id="signalsPanel">
+    <h2>📡 Live Signals <span id="signalsStale"></span></h2>
+    <div class="filters" style="margin-bottom: 14px;">
+      <div class="filter-group">
+        <span>Direction</span>
+        <button class="pill active" data-filter="dir" data-val="ALL">ALL</button>
+        <button class="pill" data-filter="dir" data-val="BULLISH">BULLISH</button>
+        <button class="pill" data-filter="dir" data-val="BEARISH">BEARISH</button>
+        <button class="pill" data-filter="dir" data-val="NEUTRAL">NEUTRAL</button>
+      </div>
+      <div class="filter-group">
+        <span>Tier</span>
+        <button class="pill active" data-filter="tier" data-val="ALL">ALL</button>
+        <button class="pill" data-filter="tier" data-val="1">T1</button>
+        <button class="pill" data-filter="tier" data-val="2">T2</button>
+        <button class="pill" data-filter="tier" data-val="3">T3</button>
+      </div>
+      <div class="filter-group">
+        <span>Category</span>
+        <button class="pill active" data-filter="cat" data-val="ALL">ALL</button>
+        <button class="pill" data-filter="cat" data-val="ta">Technical</button>
+        <button class="pill" data-filter="cat" data-val="macro">Macro</button>
+        <button class="pill" data-filter="cat" data-val="fundamental">Fundamental</button>
+      </div>
+      <div class="filter-group">
+        <span>Sort</span>
+        <button class="pill active" data-filter="sort" data-val="strength">Strength</button>
+        <button class="pill" data-filter="sort" data-val="newest">Newest</button>
+        <button class="pill" data-filter="sort" data-val="grade">Grade</button>
+      </div>
+    </div>
+    <div class="signal-grid" id="signalGrid">
+      <div class="signal-card skel-card"><div class="skel skel-line"></div><div class="skel skel-line medium"></div><div class="skel skel-line short"></div></div>
+      <div class="signal-card skel-card"><div class="skel skel-line"></div><div class="skel skel-line medium"></div><div class="skel skel-line short"></div></div>
+      <div class="signal-card skel-card"><div class="skel skel-line"></div><div class="skel skel-line medium"></div><div class="skel skel-line short"></div></div>
+    </div>
+  </section>
+
+  <!-- Watchlist -->
+  <section class="panel" id="watchPanel">
+    <h2>📋 Watchlist Scanner</h2>
+    <div class="watchlist-input-row">
+      <textarea id="watchInput" placeholder="NVDA,AAPL,MSFT,SPY,QQQ"></textarea>
+      <button id="scanBtn">Scan</button>
+      <button id="saveWatchBtn" class="secondary">Save</button>
+    </div>
+    <div id="watchResults"></div>
+  </section>
+
+  <!-- Dark pool -->
+  <section class="panel" id="dpPanel">
+    <h2>🌊 Dark Pool</h2>
+    <div class="watchlist-input-row" style="margin-bottom: 14px;">
+      <textarea id="dpTickerInput" style="min-height: 38px;" rows="1">SPY</textarea>
+      <button id="dpFetchBtn">Fetch</button>
+    </div>
+    <div id="dpBody">
+      <div class="empty">Connect and click Fetch.</div>
+    </div>
+  </section>
+
+  <!-- Earnings -->
+  <section class="panel" id="calPanel">
+    <h2>📅 Earnings Calendar</h2>
+    <div id="calBody">
+      <div class="empty">Connect to load.</div>
+    </div>
+  </section>
+
+</main>
+
+<script>
+/* ============================================================
+   App state + utilities
+   ============================================================ */
+const SIGNA_BASE = 'https://app.getsigna.ai';
+const REFRESH_MS = 5 * 60 * 1000;   // 5 minutes
+const KEY_LS = 'signa_portal_key';
+const WATCH_LS = 'signa_portal_watchlist';
+
+const state = {
+  apiKey: localStorage.getItem(KEY_LS) || '',
+  connected: false,
+  signalIndex: null,
+  scoredSignals: [],
+  signalsAt: null,
+  scoredStale: false,
+  watchlist: localStorage.getItem(WATCH_LS) || 'NVDA,AAPL,MSFT,GOOGL,AMZN,SPY,QQQ',
+  filters: { dir: 'ALL', tier: 'ALL', cat: 'ALL', sort: 'strength' },
+  refreshTimer: null,
+  countdown: REFRESH_MS / 1000
+};
+
+const $ = (id) => document.getElementById(id);
+
+function setStatus(state_, text) {
+  const dot = $('statusDot');
+  dot.classList.remove('connected', 'error');
+  if (state_ === 'connected') dot.classList.add('connected');
+  if (state_ === 'error')     dot.classList.add('error');
+  dot.title = text || '';
+}
+
+function nowStr() {
+  return new Date().toLocaleTimeString('en-US', { hour12: false });
+}
+
+function showBanner(kind, text) {
+  const el = document.createElement('div');
+  el.className = `banner ${kind}`;
+  el.textContent = text;
+  $('bannerArea').appendChild(el);
+  setTimeout(() => el.remove(), 8000);
+}
+
+function clearBanners() { $('bannerArea').innerHTML = ''; }
+
+function fmtMoney(n) {
+  if (n == null || isNaN(n)) return '—';
+  if (Math.abs(n) >= 1e9) return '$' + (n/1e9).toFixed(2) + 'B';
+  if (Math.abs(n) >= 1e6) return '$' + (n/1e6).toFixed(2) + 'M';
+  if (Math.abs(n) >= 1e3) return '$' + (n/1e3).toFixed(1) + 'K';
+  return '$' + Number(n).toFixed(2);
+}
+
+function fmtPrice(n) {
+  if (n == null || isNaN(n)) return null;
+  return '$' + Number(n).toFixed(2);
+}
+
+function trunc(s, n) {
+  if (s == null) return '';
+  s = String(s);
+  return s.length <= n ? s : s.slice(0, n - 1) + '…';
+}
+
+/* ============================================================
+   Signa API client (browser side)
+   ============================================================ */
+async function api(path, options = {}) {
+  if (!state.apiKey) throw new Error('No API key. Connect first.');
+  const url = `${SIGNA_BASE}${path}`;
+  const res = await fetch(url, {
+    method: options.method || 'GET',
+    headers: {
+      'Authorization': `Bearer ${state.apiKey}`,
+      'Content-Type': 'application/json',
+      ...(options.headers || {})
+    },
+    ...(options.body ? { body: options.body } : {})
+  });
+  if (res.status === 401) {
+    state.connected = false;
+    setStatus('error', 'Invalid API key');
+    showBanner('error', 'Invalid API key — check app.getsigna.ai/dashboard/api-keys');
+    throw new Error('401 Invalid API key');
+  }
+  if (res.status === 403) throw new Error('403 — endpoint requires higher plan tier');
+  if (res.status === 429) throw new Error('429 — rate limited, try again in a minute');
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`${res.status} ${path}: ${body.slice(0, 200)}`);
+  }
+  return res.json();
+}
+
+/* ============================================================
+   Connect flow
+   ============================================================ */
+
+if (state.apiKey) $('apiKeyInput').value = state.apiKey;
+$('watchInput').value = state.watchlist;
+
+$('connectBtn').addEventListener('click', async () => {
+  const key = $('apiKeyInput').value.trim();
+  if (!key) { showBanner('error', 'Paste an API key first.'); return; }
+  state.apiKey = key;
+  localStorage.setItem(KEY_LS, key);
+  await connect();
+});
+
+async function connect() {
+  setStatus('', 'connecting…');
+  clearBanners();
+  try {
+    await api('/api/v1/me');
+    state.connected = true;
+    setStatus('connected', 'Connected');
+    $('keyPanel').style.display = 'none';
+    showBanner('info', 'Connected to Signa.');
+    await refreshAll();
+    startAutoRefresh();
+  } catch (err) {
+    state.connected = false;
+    setStatus('error', err.message);
+    showBanner('error', err.message);
+    if (err.message.includes('Failed to fetch') || err.message.includes('CORS')) {
+      showBanner('warn', 'If you see CORS errors: this portal calls app.getsigna.ai directly from the browser. If your account does not allow browser-origin requests, open the bot version (node bot.js) instead.');
+    }
+  }
+}
+
+/* ============================================================
+   Auto-refresh
+   ============================================================ */
+
+function startAutoRefresh() {
+  stopAutoRefresh();
+  state.countdown = REFRESH_MS / 1000;
+  state.refreshTimer = setInterval(() => {
+    state.countdown -= 1;
+    if (state.countdown <= 0) {
+      refreshAll();
+      state.countdown = REFRESH_MS / 1000;
+    }
+    updateCountdown();
+  }, 1000);
+  updateCountdown();
+}
+function stopAutoRefresh() {
+  if (state.refreshTimer) { clearInterval(state.refreshTimer); state.refreshTimer = null; }
+}
+function updateCountdown() {
+  const m = Math.floor(state.countdown / 60);
+  const s = state.countdown % 60;
+  $('countdown').textContent = `· next ${m}:${String(s).padStart(2,'0')}`;
+}
+
+$('refreshBtn').addEventListener('click', () => {
+  if (!state.connected) { showBanner('warn', 'Connect first.'); return; }
+  refreshAll();
+  state.countdown = REFRESH_MS / 1000;
+});
+
+/* ============================================================
+   Refresh — pulls everything in parallel, marks stale on partial fail
+   ============================================================ */
+
+async function refreshAll() {
+  if (!state.connected) return;
+  const [idxR, scoredR, calR, dpR] = await Promise.allSettled([
+    api('/api/v1/signal-index'),
+    api('/api/signals/run?scored=true&limit=200'),
+    api('/api/calendar?weeks=2'),
+    api(`/api/darkpool/prints?ticker=SPY&limit=50`)
+  ]);
+
+  if (idxR.status === 'fulfilled') {
+    state.signalIndex = idxR.value;
+    state.scoredStale = false;
+  } else {
+    showBanner('warn', `Signal index failed: ${idxR.reason?.message || idxR.reason}`);
+    state.scoredStale = true;
+  }
+
+  if (scoredR.status === 'fulfilled') {
+    let arr = scoredR.value;
+    if (!Array.isArray(arr)) arr = arr?.signals || arr?.results || [];
+    state.scoredSignals = arr;
+    state.signalsAt = new Date();
+  } else {
+    showBanner('warn', `Scored signals failed: ${scoredR.reason?.message || scoredR.reason}`);
+    state.scoredStale = true;
+  }
+
+  renderStats();
+  renderSignals();
+
+  if (calR.status === 'fulfilled') renderCalendar(calR.value);
+  if (dpR.status === 'fulfilled') renderDarkpool(dpR.value, 'SPY');
+
+  $('lastUpdate').textContent = `updated ${nowStr()}`;
+}
+
+/* ============================================================
+   Renderers
+   ============================================================ */
+
+function renderStats() {
+  const idx = state.signalIndex || {};
+  const score = idx.score;
+  const regime = idx.regime || 'TRANSITIONAL';
+  const total = idx.total_signals != null ? idx.total_signals : state.scoredSignals.length;
+  const bull = idx.bullish_count != null ? idx.bullish_count : state.scoredSignals.filter(s => /BULL|LONG/i.test(s.direction || s.signal || '')).length;
+  const bear = idx.bearish_count != null ? idx.bearish_count : state.scoredSignals.filter(s => /BEAR|SHORT/i.test(s.direction || s.signal || '')).length;
+  const t3 = state.scoredSignals.filter(s => Number(s.alert_tier ?? s.tier) === 3).length;
+
+  // Signal index
+  const idxEl = $('statIdx');
+  if (score != null) {
+    idxEl.textContent = score;
+    idxEl.className = 'stat-value ' + (score > 65 ? 'green' : score >= 40 ? 'yellow' : 'red');
+    $('statIdxSub').textContent = idx.bull_bias != null ? `bias ${Math.round((idx.bull_bias <= 1 ? idx.bull_bias * 100 : idx.bull_bias))}%` : '0–100';
+  } else { idxEl.textContent = '—'; idxEl.className = 'stat-value muted'; }
+
+  // Regime
+  const regimeEl = $('statRegime');
+  regimeEl.innerHTML = `<span class="badge ${regime === 'RISK_ON' ? 'green' : regime === 'RISK_OFF' ? 'red' : 'yellow'}">${regime}</span>`;
+  regimeEl.style.fontSize = '20px';
+
+  // Total
+  $('statTotal').textContent = total;
+  $('statTotal').className = 'stat-value';
+  $('statTotalSub').textContent = state.signalsAt ? `as of ${state.signalsAt.toLocaleTimeString('en-US', {hour12:false})}` : '—';
+
+  // Bull/Bear
+  const bbEl = $('statBullBear');
+  bbEl.innerHTML = `<span style="color:var(--green)">${bull}</span> <span style="color:var(--muted);font-size:18px">·</span> <span style="color:var(--red)">${bear}</span>`;
+  bbEl.className = 'stat-value';
+  $('statBullBearSub').textContent = `📈 bullish · 📉 bearish`;
+
+  // Tier 3
+  const t3El = $('statT3');
+  t3El.textContent = t3;
+  t3El.className = 'stat-value ' + (t3 > 0 ? 'red' : 'muted');
+}
+
+function priorityScore(s) {
+  const tier = Number(s.alert_tier ?? s.tier ?? 1);
+  const dir = String(s.direction || s.signal || '').toUpperCase();
+  const grade = String(s.grade || 'F').toUpperCase();
+  const score = Number(s.composite_score ?? s.score ?? 0);
+  if (tier === 3) return 1000 + score;
+  if (tier === 2 && /BULL|LONG/.test(dir)) return 800 + score;
+  if (tier === 2 && /BEAR|SHORT/.test(dir)) return 600 + score;
+  if (tier === 1 && grade === 'A') return 400 + score;
+  return score;
+}
+
+function applyFilters(signals) {
+  let out = [...signals];
+  const f = state.filters;
+  if (f.dir !== 'ALL') {
+    out = out.filter(s => {
+      const d = String(s.direction || s.signal || '').toUpperCase();
+      if (f.dir === 'BULLISH') return /BULL|LONG/.test(d);
+      if (f.dir === 'BEARISH') return /BEAR|SHORT/.test(d);
+      return d === f.dir;
+    });
+  }
+  if (f.tier !== 'ALL') {
+    out = out.filter(s => Number(s.alert_tier ?? s.tier) === Number(f.tier));
+  }
+  if (f.cat !== 'ALL') {
+    out = out.filter(s => {
+      const cats = s.categories || [];
+      if (f.cat === 'fundamental') return cats.includes('fundamental') || cats.includes('quality') || cats.includes('value');
+      return cats.includes(f.cat);
+    });
+  }
+  if (f.sort === 'strength') out.sort((a, b) => priorityScore(b) - priorityScore(a));
+  else if (f.sort === 'newest') out.sort((a, b) => new Date(b.generated_at || 0) - new Date(a.generated_at || 0));
+  else if (f.sort === 'grade') out.sort((a, b) => String(a.grade || 'Z').localeCompare(String(b.grade || 'Z')) || priorityScore(b) - priorityScore(a));
+  return out;
+}
+
+function signalCardHtml(s) {
+  const dir = String(s.direction || s.signal || 'NEUTRAL').toUpperCase();
+  const dirClass = /BULL|LONG/.test(dir) ? 'bullish' : /BEAR|SHORT/.test(dir) ? 'bearish' : 'neutral';
+  const dirBadge = /BULL|LONG/.test(dir) ? 'BULLISH' : /BEAR|SHORT/.test(dir) ? 'BEARISH' : 'NEUTRAL';
+  const tier = Number(s.alert_tier ?? s.tier ?? 1);
+  const grade = String(s.grade || '?').toUpperCase();
+  const score = Number(s.composite_score ?? s.score ?? 0);
+  const conf = s.confidence != null ? (s.confidence <= 1 ? Math.round(s.confidence * 100) : Math.round(s.confidence)) : 0;
+  const drivers = (s.key_drivers || s.reasons || []).slice(0, 2);
+  const modelName = (s.model_names && s.model_names.length) ? s.model_names.slice(0, 2).join(', ')
+    : (s.model_count ? `${s.model_count} model${s.model_count > 1 ? 's' : ''}` : '');
+
+  const posParts = [];
+  if (s.entry_price != null) posParts.push(`<span class="pos-item">entry <b>${fmtPrice(s.entry_price)}</b></span>`);
+  if (s.stop_level != null)  posParts.push(`<span class="pos-item">stop <b>${fmtPrice(s.stop_level)}</b></span>`);
+  if (s.target_price != null) posParts.push(`<span class="pos-item">target <b>${fmtPrice(s.target_price)}</b></span>`);
+
+  return `
+    <div class="signal-card ${dirClass}">
+      <div class="signal-top">
+        <span class="signal-ticker">${s.ticker || '—'}</span>
+        <span class="signal-badges">
+          <span class="mini-badge dir-${dirClass}">${dirBadge}</span>
+          <span class="mini-badge tier-${tier}">T${tier}</span>
+          <span class="mini-badge grade-${grade}">${grade}</span>
+        </span>
+      </div>
+      <div class="score-bar"><div class="score-fill" style="width:${Math.min(100, Math.max(0, score))}%"></div></div>
+      <div class="score-meta"><span>score ${score}</span><span>${conf}% conf</span></div>
+      ${drivers.map(d => `<div class="signal-driver">${escapeHtml(trunc(d, 100))}</div>`).join('')}
+      ${posParts.length ? `<div class="signal-position">${posParts.join('')}</div>` : ''}
+      ${modelName ? `<div class="signal-model">${escapeHtml(modelName)}</div>` : ''}
+    </div>
+  `;
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function renderSignals() {
+  const grid = $('signalGrid');
+  const filtered = applyFilters(state.scoredSignals);
+  if (filtered.length === 0) {
+    grid.innerHTML = '<div class="empty">No signals match your filters.</div>';
+  } else {
+    grid.innerHTML = filtered.map(signalCardHtml).join('');
+  }
+  $('signalsStale').innerHTML = state.scoredStale ? '<span class="stale-tag">⚠️ STALE</span>' : '';
+}
+
+// Filter pill clicks
+document.querySelectorAll('.pill[data-filter]').forEach(p => {
+  p.addEventListener('click', () => {
+    const f = p.dataset.filter; const v = p.dataset.val;
+    document.querySelectorAll(`.pill[data-filter="${f}"]`).forEach(x => x.classList.remove('active'));
+    p.classList.add('active');
+    state.filters[f] = v;
+    renderSignals();
+  });
+});
+
+/* ============================================================
+   Watchlist scanner
+   ============================================================ */
+
+$('scanBtn').addEventListener('click', async () => {
+  if (!state.connected) { showBanner('warn', 'Connect first.'); return; }
+  const tickers = $('watchInput').value.split(',').map(t => t.trim().toUpperCase()).filter(Boolean).slice(0, 50);
+  if (tickers.length === 0) { showBanner('warn', 'Enter tickers comma-separated.'); return; }
+  $('watchResults').innerHTML = '<div class="empty">Scanning…</div>';
+  try {
+    // /api/screener is session-authed only; /api/v1/scan accepts our Bearer token.
+    const raw = await api(`/api/v1/scan?symbols=${encodeURIComponent(tickers.join(','))}`);
+    const res = normalizeScanResponse(raw, tickers);
+    renderWatchResults(res, tickers);
+  } catch (err) {
+    $('watchResults').innerHTML = `<div class="banner error">${escapeHtml(err.message)}</div>`;
+  }
+});
+
+// Convert /api/v1/scan output into the {results, pipeline_count, local_count}
+// shape renderWatchResults expects.
+function normalizeScanResponse(raw, requested) {
+  const items = Array.isArray(raw?.results) ? raw.results : [];
+  const tierFromLabel = (label, score) => {
+    const s = Number(score) || 0;
+    const L = String(label || '').toUpperCase();
+    if (L === 'HOT')   return s >= 70 ? 3 : 2;
+    if (L === 'WATCH') return s >= 55 ? 2 : 1;
+    return 1;
+  };
+  const gradeFromScore = (score) => {
+    const s = Number(score) || 0;
+    if (s >= 70) return 'A';
+    if (s >= 55) return 'B';
+    if (s >= 40) return 'C';
+    if (s >= 25) return 'D';
+    return 'F';
+  };
+  const dirFromBias = (bias) => {
+    const b = String(bias || '').toLowerCase();
+    if (b.includes('bull')) return 'BULLISH';
+    if (b.includes('bear')) return 'BEARISH';
+    return 'NEUTRAL';
+  };
+
+  const found = new Set();
+  const results = items.map(r => {
+    const ticker = String(r.symbol || r.ticker || '').toUpperCase();
+    if (ticker) found.add(ticker);
+    return {
+      ticker,
+      signal: dirFromBias(r.bias),
+      grade: gradeFromScore(r.score),
+      score: r.score != null ? Math.round(Number(r.score)) : null,
+      confidence: r.confidence != null ? Number(r.confidence) : null,
+      total_agents: Array.isArray(r.triggers) ? r.triggers.length : null,
+      tier: tierFromLabel(r.tier, r.score),
+      reasons: Array.isArray(r.triggers) ? r.triggers.slice(0, 5) : [],
+      source: 'pipeline'
+    };
+  });
+  for (const t of requested) {
+    if (!found.has(t)) {
+      results.push({
+        ticker: t, signal: null, grade: null, score: null,
+        confidence: null, total_agents: null, tier: null,
+        reasons: [], source: 'local'
+      });
+    }
+  }
+  return {
+    results,
+    pipeline_count: results.filter(r => r.source === 'pipeline').length,
+    local_count: results.filter(r => r.source === 'local').length
+  };
+}
+
+$('saveWatchBtn').addEventListener('click', () => {
+  const v = $('watchInput').value.trim();
+  state.watchlist = v;
+  localStorage.setItem(WATCH_LS, v);
+  showBanner('info', 'Watchlist saved to this browser.');
+});
+
+function renderWatchResults(data, requested) {
+  const results = data?.results || [];
+  if (results.length === 0) {
+    $('watchResults').innerHTML = '<div class="empty">No results.</div>';
+    return;
+  }
+  const sorted = [...results].sort((a, b) => priorityScore(b) - priorityScore(a));
+  const rows = sorted.map(r => {
+    const dir = String(r.signal || '—').toUpperCase();
+    const dCls = /BULL|LONG/.test(dir) ? 'green' : /BEAR|SHORT/.test(dir) ? 'red' : 'muted';
+    const grade = r.grade ? String(r.grade).toUpperCase() : '—';
+    const conf = r.confidence != null ? (r.confidence <= 1 ? Math.round(r.confidence * 100) : Math.round(r.confidence)) : '—';
+    const reasons = (r.reasons || []).slice(0, 2).map(x => trunc(x, 80)).join(' · ');
+    return `
+      <tr>
+        <td class="mono"><b>${escapeHtml(r.ticker)}</b></td>
+        <td><span class="badge ${dCls === 'green' ? 'green' : dCls === 'red' ? 'red' : 'yellow'}">${dir === '—' ? '—' : dir}</span></td>
+        <td class="mono">${grade}</td>
+        <td class="mono">${r.score ?? '—'}</td>
+        <td class="mono">${conf === '—' ? '—' : conf + '%'}</td>
+        <td class="mono">${r.total_agents ?? '—'}</td>
+        <td>${escapeHtml(reasons)}</td>
+      </tr>`;
+  }).join('');
+  $('watchResults').innerHTML = `
+    <table class="table">
+      <thead><tr>
+        <th>Ticker</th><th>Signal</th><th>Grade</th><th>Score</th><th>Conf</th><th>Agents</th><th>Reasons</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div style="font-size:11px;color:var(--muted);margin-top:8px;font-family:var(--mono);">
+      pipeline: ${data.pipeline_count ?? 0} · local: ${data.local_count ?? 0}
+    </div>`;
+}
+
+/* ============================================================
+   Dark pool
+   ============================================================ */
+
+$('dpFetchBtn').addEventListener('click', async () => {
+  if (!state.connected) { showBanner('warn', 'Connect first.'); return; }
+  const ticker = ($('dpTickerInput').value || 'SPY').trim().toUpperCase();
+  $('dpBody').innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const res = await api(`/api/darkpool/prints?ticker=${encodeURIComponent(ticker)}&limit=50`);
+    renderDarkpool(res, ticker);
+  } catch (err) {
+    $('dpBody').innerHTML = `<div class="banner error">${escapeHtml(err.message)}</div>`;
+  }
+});
+
+function renderDarkpool(data, ticker) {
+  const summary = data?.summary || {};
+  const prints = data?.prints || [];
+  const buy = Number(summary.buy_premium || 0);
+  const sell = Number(summary.sell_premium || 0);
+  const total = buy + sell || 1;
+  const buyPct = Math.round((buy / total) * 100);
+  const sellPct = 100 - buyPct;
+  const agg = summary.net_aggressor || 'NEUTRAL';
+  const aggClass = agg === 'BUY' ? 'green' : agg === 'SELL' ? 'red' : 'yellow';
+
+  const recent = prints.slice(0, 5).map(p => `
+    <tr>
+      <td class="mono">${new Date(p.executed_at).toLocaleTimeString('en-US', {hour12:false})}</td>
+      <td class="mono">${fmtPrice(p.price) ?? '—'}</td>
+      <td class="mono">${(p.size ?? 0).toLocaleString()}</td>
+      <td class="mono">${fmtMoney(p.premium)}</td>
+      <td class="mono">${escapeHtml(p.aggressor || 'NEUTRAL')}</td>
+    </tr>`).join('');
+
+  $('dpBody').innerHTML = `
+    <div class="dp-row">
+      <div><div class="dp-label">Net Aggressor (${escapeHtml(ticker)})</div><div class="dp-val" style="color:var(--${aggClass})">${agg}</div></div>
+      <div><div class="dp-label">Total Premium</div><div class="dp-val">${fmtMoney(summary.total_premium)}</div></div>
+      <div><div class="dp-label">Blocks</div><div class="dp-val">${summary.block_count ?? 0}</div></div>
+      <div><div class="dp-label">Active Prints</div><div class="dp-val">${summary.active ?? summary.total ?? 0}</div></div>
+    </div>
+    <div class="dp-bar-row">
+      <div class="dp-bar">
+        ${buyPct  > 0 ? `<div class="dp-bar-buy"  style="width:${buyPct}%">${buyPct}% buy ${fmtMoney(buy)}</div>` : ''}
+        ${sellPct > 0 ? `<div class="dp-bar-sell" style="width:${sellPct}%">${sellPct}% sell ${fmtMoney(sell)}</div>` : ''}
+      </div>
+    </div>
+    ${recent ? `
+    <table class="table" style="margin-top:8px;">
+      <thead><tr><th>Time</th><th>Price</th><th>Size</th><th>Premium</th><th>Aggressor</th></tr></thead>
+      <tbody>${recent}</tbody>
+    </table>` : '<div class="empty">No recent prints.</div>'}
+  `;
+}
+
+/* ============================================================
+   Calendar
+   ============================================================ */
+
+function renderCalendar(data) {
+  const earnings = (data?.earnings || []).slice(0, 30);
+  if (earnings.length === 0) {
+    $('calBody').innerHTML = '<div class="empty">No earnings in the next two weeks.</div>';
+    return;
+  }
+  // Take next 3 days
+  const today = new Date(); today.setHours(0,0,0,0);
+  const cutoff = new Date(today); cutoff.setDate(today.getDate() + 3);
+  const upcoming = earnings.filter(e => {
+    const d = new Date(e.date);
+    return !isNaN(d) && d >= today && d <= cutoff;
+  }).sort((a,b) => new Date(a.date) - new Date(b.date));
+
+  if (upcoming.length === 0) {
+    $('calBody').innerHTML = '<div class="empty">No earnings in the next 3 days.</div>';
+    return;
+  }
+
+  const rows = upcoming.map(e => `
+    <tr>
+      <td class="mono"><b>${escapeHtml(e.ticker)}</b></td>
+      <td>${escapeHtml(e.name || '—')}</td>
+      <td class="mono">${escapeHtml(e.date)}</td>
+      <td class="mono">${e.time === 'pre-market' ? '🌅 pre' : e.time === 'post-market' ? '🌙 post' : '—'}</td>
+      <td class="mono">${e.epsEstimate != null ? Number(e.epsEstimate).toFixed(2) : '—'}</td>
+    </tr>`).join('');
+  $('calBody').innerHTML = `
+    <table class="table">
+      <thead><tr><th>Ticker</th><th>Name</th><th>Date</th><th>Session</th><th>EPS Est</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+/* ============================================================
+   Auto-connect on load if key exists
+   ============================================================ */
+if (state.apiKey) {
+  $('keyPanel').style.display = 'none';
+  connect();
+} else {
+  setStatus('', 'Not connected');
+}
+</script>
+</body>
+</html>
