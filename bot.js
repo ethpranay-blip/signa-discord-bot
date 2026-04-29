@@ -12,6 +12,7 @@ import {
   getMe,
   getSignalIndex,
   getScoredSignals,
+  getSignalFeed,
   getDarkPool,
   getCalendar,
   screenTickers,
@@ -231,6 +232,49 @@ async function postToDiscord(webhookUrl, payload, jobLabel = 'job') {
 }
 
 // ============================================================
+// Tier 3 enrichment helper
+// Fetches raw signal feed + per-ticker Action Cards, then builds
+// the refined Tier 3 alert and posts it to #micro.
+// ============================================================
+async function emitEnrichedTier3Alert(tier3, allScored, signalIndex, jobLabel) {
+  if (!tier3 || tier3.length === 0) return null;
+
+  // Fetch raw signal feed (for model attribution + agent-level levels)
+  let signalFeed = [];
+  try {
+    const feed = await getSignalFeed(200);
+    signalFeed = Array.isArray(feed?.signals) ? feed.signals
+              : Array.isArray(feed) ? feed
+              : [];
+  } catch (err) {
+    logErr(`  ⚠️  Tier 3 enrichment: signal feed unavailable: ${err.message}`);
+  }
+
+  // Fetch Action Cards for each Tier 3 ticker (typically 0-3)
+  const actionCards = {};
+  await Promise.all(
+    tier3.slice(0, 5).map(async (s) => {
+      const ticker = String(s.ticker || '').toUpperCase();
+      if (!ticker) return;
+      try {
+        const card = await getSignal(ticker);
+        actionCards[ticker] = card?.data ?? card?.action_card ?? card?.signal ?? card;
+      } catch (err) {
+        // Action Card is enrichment-only; alert still fires without it.
+        logErr(`  ⚠️  Action Card unavailable for ${ticker}: ${err.message}`);
+      }
+    })
+  );
+
+  const alert = buildTier3Alert(allScored, { signalFeed, signalIndex, actionCards });
+  if (alert) {
+    await postToDiscord(route('micro'), alert, jobLabel);
+    return alert;
+  }
+  return null;
+}
+
+// ============================================================
 // JOB 1 — Nightly digest
 // ============================================================
 
@@ -278,11 +322,11 @@ async function runNightlyDigest() {
   const digest = buildDailyDigest(signalIndex, scored, calendar, darkpool, WATCHLIST);
   await postToDiscord(route('signals'), digest, 'nightly-digest');
 
-  // 2) Tier 3 alerts (separate channel if configured)
+  // 2) Tier 3 alerts — enriched with raw feed, signal index, and Action Cards
   const tier3 = scored.filter(s => Number(s.alert_tier ?? s.tier) === 3);
   if (tier3.length > 0) {
-    const alert = buildTier3Alert(scored);
-    if (alert) await postToDiscord(route('micro'), alert, 'tier3-alert');
+    const alert = await emitEnrichedTier3Alert(tier3, scored, signalIndex, 'tier3-alert');
+    if (!alert) log('  Tier 3 enrichment returned no alert');
   }
 
   // 3) Watchlist summary
@@ -303,15 +347,20 @@ async function runNightlyDigest() {
 async function runMiddayCheck() {
   log('☀️ Midday Tier 3 sweep…');
   try {
-    let scored = await getScoredSignals(200);
+    const [scoredRes, signalIndexRes] = await Promise.allSettled([
+      getScoredSignals(200),
+      getSignalIndex()
+    ]);
+    let scored = scoredRes.status === 'fulfilled' ? scoredRes.value : [];
     if (!Array.isArray(scored)) scored = scored?.signals || scored?.results || [];
+    const signalIndex = signalIndexRes.status === 'fulfilled' ? signalIndexRes.value : null;
+
     const tier3 = scored.filter(s => Number(s.alert_tier ?? s.tier) === 3);
     if (tier3.length === 0) {
       log('  No Tier 3 signals at midday.');
       return;
     }
-    const alert = buildTier3Alert(scored);
-    if (alert) await postToDiscord(route('micro'), alert, 'midday-tier3');
+    await emitEnrichedTier3Alert(tier3, scored, signalIndex, 'midday-tier3');
   } catch (err) {
     logErr(`❌ midday-check failed: ${err.message}`);
   }

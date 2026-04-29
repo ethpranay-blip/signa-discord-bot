@@ -279,28 +279,158 @@ function formatSignalLine(s) {
 }
 
 // ============================================================
-// 2) buildTier3Alert
+// 2) buildTier3Alert — refined (Phase 2)
+//
+// Signature: buildTier3Alert(signals, opts?)
+//
+// signals: array of scored signals (from getScoredSignals())
+// opts (all optional):
+//   - signalFeed: array of raw signals (from getSignalFeed()) — used to find
+//                 entry/stop/target levels from agreeing agents
+//   - signalIndex: normalized signal index obj (from getSignalIndex()) — used
+//                  for regime + sizing context
+//   - actionCards: { TICKER: actionCardData } — pre-fetched Action Cards for
+//                  finer grades (A+/B+/etc.). Async fetch happens in bot.js,
+//                  this function is sync.
 // ============================================================
 
-export function buildTier3Alert(signals) {
+// Convert a Signa regime string into a sizing recommendation.
+// Mirrors Signa's published methodology: full size in RISK_ON, dampened
+// in TRANSITIONAL, defensive in RISK_OFF.
+function sizingForRegime(regime, direction) {
+  const r = String(regime || '').toUpperCase();
+  const dir = String(direction || '').toUpperCase();
+  const isBull = /BULL|LONG/.test(dir);
+  const isBear = /BEAR|SHORT/.test(dir);
+
+  if (r === 'RISK_ON') {
+    return {
+      multiplier: 1.0,
+      label: isBull ? 'Full size — regime favors bulls'
+            : isBear ? '0.5× — regime headwind for shorts'
+            : 'Full size'
+    };
+  }
+  if (r === 'RISK_OFF') {
+    return {
+      multiplier: isBull ? 0.35 : isBear ? 1.0 : 0.5,
+      label: isBull ? '0.35× — RISK_OFF dampens longs heavily; consider skipping'
+            : isBear ? 'Full size — regime favors shorts'
+            : '0.5× — defensive regime'
+    };
+  }
+  // TRANSITIONAL or unknown
+  return {
+    multiplier: 0.65,
+    label: '0.65× — TRANSITIONAL regime; require strong confluence'
+  };
+}
+
+// Find the strongest agreeing agent in the signal feed for a given
+// (ticker, direction) pair. Returns levels if any agent supplied them.
+function findAgreeingAgents(signalFeed, ticker, direction) {
+  if (!Array.isArray(signalFeed)) return [];
+  const dir = String(direction || '').toUpperCase();
+  const wantBull = /BULL|LONG|BUY/.test(dir);
+  const wantBear = /BEAR|SHORT|SELL/.test(dir);
+
+  return signalFeed
+    .filter(s => String(s.ticker || '').toUpperCase() === String(ticker).toUpperCase())
+    .filter(s => {
+      const sig = String(s.signal || '').toUpperCase();
+      if (wantBull) return /BULL|LONG|BUY/.test(sig);
+      if (wantBear) return /BEAR|SHORT|SELL/.test(sig);
+      return true;
+    })
+    .sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
+}
+
+// Pick the best entry/stop/target across agreeing agents.
+// Strategy: take the median of each level across all agents that supplied it,
+// since different models may suggest slightly different levels.
+function consensusLevels(agreeingAgents) {
+  const median = (arr) => {
+    const nums = arr.filter(x => x != null && !isNaN(Number(x))).map(Number).sort((a, b) => a - b);
+    if (nums.length === 0) return null;
+    const mid = Math.floor(nums.length / 2);
+    return nums.length % 2 === 0 ? (nums[mid - 1] + nums[mid]) / 2 : nums[mid];
+  };
+  return {
+    entry:  median(agreeingAgents.map(a => a.entry_price)),
+    stop:   median(agreeingAgents.map(a => a.stop_level)),
+    target: median(agreeingAgents.map(a => a.target_price))
+  };
+}
+
+// Friendly model name from agent ID or model_name field.
+function friendlyModelName(agent) {
+  return agent.model_name || agent.modelName
+    || (agent.model_id || agent.modelId || '').replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
+    || 'Unknown';
+}
+
+export function buildTier3Alert(signals, opts = {}) {
   const tier3 = (signals || []).filter(s => Number(s.alert_tier ?? s.tier) === 3);
   if (tier3.length === 0) return null;
+
+  const signalFeed = opts.signalFeed || [];
+  const signalIndex = opts.signalIndex || null;
+  const actionCards = opts.actionCards || {};
 
   const sorted = sortByPriority(tier3).slice(0, 5);
 
   const embeds = sorted.map(s => {
+    const ticker = String(s.ticker || '').toUpperCase();
     const dir = String(s.direction || s.signal || 'NEUTRAL').toUpperCase();
-    const grade = String(s.grade || '?').toUpperCase();
+    // Prefer Action Card grade (e.g. "A+", "B-") over scored grade ("A").
+    const acData = actionCards[ticker];
+    const acGrade = acData
+      ? String(acData.grade ?? acData.letter_grade ?? '').toUpperCase()
+      : null;
+    const grade = acGrade || String(s.grade || '?').toUpperCase();
+
     const score = s.composite_score ?? s.score ?? 0;
     const conf = s.confidence != null
       ? (s.confidence <= 1 ? Math.round(s.confidence * 100) : Math.round(s.confidence))
       : 0;
     const color = DIR_COLOR[dir] ?? DIR_COLOR.NEUTRAL;
 
+    // Regime: use index regime if available, else per-signal regime
+    const regime = signalIndex?.regime || s.regime || 'UNKNOWN';
+    const sizing = sizingForRegime(regime, dir);
+
+    // Find agreeing agents in raw feed for richer model attribution + levels
+    const agreeing = findAgreeingAgents(signalFeed, ticker, dir);
+    const topAgents = agreeing.slice(0, 3);
+    const topModelStr = topAgents.length > 0
+      ? topAgents
+          .map(a => {
+            const name = friendlyModelName(a);
+            const c = a.confidence != null
+              ? Math.round((a.confidence <= 1 ? a.confidence * 100 : a.confidence))
+              : null;
+            return c != null ? `${name} (${c})` : name;
+          })
+          .join(', ')
+      : null;
+
+    // Levels: prefer parent signal, fall back to feed consensus
+    let entry  = s.entry_price;
+    let stop   = s.stop_level;
+    let target = s.target_price;
+    if (entry == null && stop == null && target == null && agreeing.length > 0) {
+      const lv = consensusLevels(agreeing);
+      entry  = lv.entry;
+      stop   = lv.stop;
+      target = lv.target;
+    }
+
     const descLines = [
-      `**Score:** \`${score}/100\`   **Confidence:** \`${conf}%\``,
-      `**Regime:** ${s.regime || 'UNKNOWN'}${s.regime_multiplier && s.regime_multiplier !== 1 ? ` (×${s.regime_multiplier})` : ''}`,
-      `**Models:** ${s.model_count ?? 0} agreeing${s.category_diversity ? ` · diversity ${s.category_diversity}` : ''}`,
+      `**Score:** \`${score}/100\`   **Confidence:** \`${conf}%\`   **Grade:** ${GRADE_EMOJI[grade?.[0]] || ''} \`${grade}\``,
+      `**Regime:** ${regime}  ·  **Sizing:** ${sizing.label}`,
+      topModelStr
+        ? `**${s.model_count ?? agreeing.length} models agreeing** — top: ${topModelStr}`
+        : `**Models:** ${s.model_count ?? 0} agreeing${s.category_diversity ? ` · diversity ${s.category_diversity}` : ''}`
     ];
     if (s.conflict_detected) {
       descLines.push('⚠️  **Model conflict detected** — read drivers carefully.');
@@ -326,18 +456,17 @@ export function buildTier3Alert(signals) {
     }
 
     const posLines = [];
-    if (s.entry_price != null) posLines.push(`Entry: \`${fmtPrice(s.entry_price)}\``);
-    if (s.stop_level != null) posLines.push(`Stop: \`${fmtPrice(s.stop_level)}\``);
-    if (s.target_price != null) posLines.push(`Target: \`${fmtPrice(s.target_price)}\``);
-    if (s.suggested_size_pct != null && s.suggested_size_pct > 0) {
-      posLines.push(`Size: \`${s.suggested_size_pct}%\``);
-    }
-    if (posLines.length > 0) {
-      fields.push({ name: 'Position', value: posLines.join('  ·  '), inline: false });
-    }
+    if (entry  != null) posLines.push(`Entry \`${fmtPrice(entry)}\``);
+    if (stop   != null) posLines.push(`Stop \`${fmtPrice(stop)}\``);
+    if (target != null) posLines.push(`Target \`${fmtPrice(target)}\``);
+    const finalSize = (s.suggested_size_pct != null && s.suggested_size_pct > 0)
+      ? s.suggested_size_pct
+      : Math.round(sizing.multiplier * 100);
+    posLines.push(`Size \`${finalSize}%\``);
+    fields.push({ name: 'Position', value: posLines.join('  ·  '), inline: false });
 
     return {
-      title: `🔴 ${s.ticker} — ${dir} · Tier 3 · Grade ${grade}`,
+      title: `🔴 ${ticker} — ${dir} · Tier 3 · Grade ${grade}`,
       description: descLines.join('\n'),
       color,
       fields,
