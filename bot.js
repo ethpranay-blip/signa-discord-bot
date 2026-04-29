@@ -18,7 +18,8 @@ import {
   screenTickers,
   getEnhancedSignal,
   getQuote,
-  getSignal
+  getSignal,
+  runBacktest
 } from './signa-client.js';
 
 import {
@@ -32,7 +33,8 @@ import {
   buildStartupNotice,
   buildEarningsActionCard60,
   buildEarningsActionCard15,
-  buildEarningsFollowUp
+  buildEarningsFollowUp,
+  buildBacktestResult
 } from './formatter.js';
 
 // --- Environment ---
@@ -579,6 +581,83 @@ export async function lookupTicker(ticker) {
 }
 
 // ============================================================
+// On-demand: runBacktestForTicker (Phase 2 Feature 3)
+//
+// Runs a backtest for a single ticker with the swing-default profile,
+// fetches an SPY benchmark over the same window, and posts both to
+// #backtest. Used by --backtest CLI flag and (later) by the slash
+// command.
+// ============================================================
+
+// Default exit profiles. The slash command will let the user pick.
+export const BACKTEST_PROFILES = {
+  swing:    { stopLoss: 0.05, takeProfit: 0.10, holdingPeriod: 30 },
+  daytrade: { stopLoss: 0.02, takeProfit: 0.04, holdingPeriod: 5 },
+  position: { stopLoss: 0.08, takeProfit: 0.20, holdingPeriod: 90 }
+};
+
+// Compute a default 2-year window ending today (ET).
+function defaultBacktestWindow() {
+  const todayET = new Date().toLocaleDateString('en-CA', { timeZone: TZ });
+  const start = new Date(todayET);
+  start.setFullYear(start.getFullYear() - 2);
+  return {
+    startDate: start.toISOString().slice(0, 10),
+    endDate: todayET
+  };
+}
+
+export async function runBacktestForTicker(ticker, options = {}) {
+  if (!ticker) throw new Error('runBacktestForTicker: ticker required');
+  const t = String(ticker).trim().toUpperCase();
+  log(`📊 Backtesting ${t}…`);
+
+  const profileName = options.profile || 'swing';
+  const profile = BACKTEST_PROFILES[profileName] || BACKTEST_PROFILES.swing;
+  const win = options.window || defaultBacktestWindow();
+
+  const params = {
+    symbol: t,
+    startDate: options.startDate || win.startDate,
+    endDate: options.endDate || win.endDate,
+    initialCapital: options.initialCapital || 100000,
+    positionSize: options.positionSize || 0.1,
+    ...profile
+  };
+
+  // Fetch ticker backtest + SPY benchmark in parallel
+  const [tickerBT, spyBT] = await Promise.allSettled([
+    runBacktest(params),
+    runBacktest({ ...params, symbol: 'SPY' })
+  ]);
+
+  if (tickerBT.status === 'rejected') {
+    logErr(`❌ Backtest failed for ${t}: ${tickerBT.reason?.message || tickerBT.reason}`);
+    return false;
+  }
+
+  const opts = {
+    spyBacktest: spyBT.status === 'fulfilled' ? spyBT.value : null
+  };
+  if (spyBT.status === 'rejected') {
+    logErr(`  ⚠️  SPY benchmark failed: ${spyBT.reason?.message || spyBT.reason} — posting without benchmark`);
+  }
+
+  const payload = buildBacktestResult(t, tickerBT.value, opts);
+  if (!payload) {
+    logErr(`❌ Backtest payload empty for ${t}`);
+    return false;
+  }
+
+  const ok = await postToDiscord(route('backtest'), payload, `backtest-${t}`);
+  if (ok) {
+    const s = tickerBT.value.summary;
+    log(`  ✓ ${t}: ${s.totalTrades} trades, ${Math.round((s.winRate || 0) * 100)}% WR, ${s.totalReturnPercent?.toFixed(1)}% return`);
+  }
+  return ok;
+}
+
+// ============================================================
 // Startup
 // ============================================================
 
@@ -694,6 +773,8 @@ process.on('uncaughtException', (err) => {
 //   node bot.js --darkpool-now    → fire one dark-pool check, exit
 //   node bot.js --tier3-now       → fire one tier-3 sweep, exit
 //   node bot.js --earnings-now    → fire one earnings check, exit
+//   node bot.js --backtest TICKER [profile] → run backtest, post to #backtest, exit
+//                                  profile: swing (default) | daytrade | position
 // ============================================================
 
 const cliArgs = process.argv.slice(2);
@@ -721,6 +802,24 @@ if (cliArgs.includes('--digest-now')) {
   runOneShot('Tier-3 sweep', runMiddayCheck);
 } else if (cliArgs.includes('--earnings-now')) {
   runOneShot('Earnings check', runEarningsCheck);
+} else if (cliArgs.includes('--backtest')) {
+  // node bot.js --backtest NVDA [profile]
+  const idx = cliArgs.indexOf('--backtest');
+  const ticker = cliArgs[idx + 1];
+  const profile = cliArgs[idx + 2];
+  if (!ticker || ticker.startsWith('--')) {
+    console.error('\n❌ Usage: node bot.js --backtest TICKER [profile]\n');
+    console.error('   profile: swing (default) | daytrade | position\n');
+    process.exit(1);
+  }
+  if (profile && !BACKTEST_PROFILES[profile]) {
+    console.error(`\n❌ Unknown profile "${profile}". Use: swing, daytrade, or position.\n`);
+    process.exit(1);
+  }
+  runOneShot(
+    `Backtest ${ticker.toUpperCase()} (${profile || 'swing'})`,
+    () => runBacktestForTicker(ticker, { profile: profile || 'swing' })
+  );
 } else {
   // Normal run — start scheduled bot
   startup().catch(err => {

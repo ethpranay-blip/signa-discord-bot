@@ -127,14 +127,28 @@ export async function getMe() {
   return signaFetch('/api/v1/me');
 }
 
+// getSignalIndex — Signa's response uses different field names than originally
+// documented. We normalize to a stable shape so the rest of the bot doesn't care.
+//
+// Stable output shape:
+//   { score, regime, sentiment, bull_bias, total_signals,
+//     bullish_count, bearish_count, neutral_count,
+//     avg_confidence, top_signals, generated_at, raw }
 export async function getSignalIndex() {
   const raw = await signaFetch('/api/v1/signal-index');
+
+  // Sentiment ("greed"/"fear"/"neutral") → regime mapping.
+  // Greed = market leaning bullish = RISK_ON
+  // Fear  = market leaning bearish = RISK_OFF
+  // Neutral / mixed = TRANSITIONAL
   const sentimentToRegime = (s) => {
     const v = String(s || '').toLowerCase();
     if (v === 'greed' || v === 'extreme_greed' || v === 'risk_on')  return 'RISK_ON';
     if (v === 'fear'  || v === 'extreme_fear'  || v === 'risk_off') return 'RISK_OFF';
     return 'TRANSITIONAL';
   };
+
+  // Field accessors that handle both the original spec shape AND the actual shape.
   const score        = raw?.score        ?? raw?.value;
   const sentiment    = raw?.sentiment    ?? raw?.regime;
   const regime       = raw?.regime       ?? sentimentToRegime(raw?.sentiment);
@@ -143,10 +157,14 @@ export async function getSignalIndex() {
   const bullishPct   = components.bullish ?? raw?.bull_bias_pct;
   const bearishPct   = components.bearish ?? raw?.bear_bias_pct;
   const neutralPct   = components.neutral;
+
+  // bull_bias as a 0-1 fraction, derived if needed
   let bullBias = raw?.bull_bias;
   if (bullBias == null && bullishPct != null) {
     bullBias = bullishPct > 1 ? bullishPct / 100 : bullishPct;
   }
+
+  // Counts from percentages × covered count (only meaningful if both exist)
   const cov = totalSignals;
   const bullishCount = raw?.bullish_count
     ?? (bullishPct != null && cov ? Math.round((bullishPct / 100) * cov) : null);
@@ -154,8 +172,11 @@ export async function getSignalIndex() {
     ?? (bearishPct != null && cov ? Math.round((bearishPct / 100) * cov) : null);
   const neutralCount = raw?.neutral_count
     ?? (neutralPct != null && cov ? Math.round((neutralPct / 100) * cov) : null);
+
   return {
-    score, regime, sentiment,
+    score,
+    regime,
+    sentiment,
     bull_bias: bullBias,
     total_signals: totalSignals,
     bullish_count: bullishCount,
@@ -168,7 +189,7 @@ export async function getSignalIndex() {
     top_signals: Array.isArray(raw?.topSignals) ? raw.topSignals : [],
     universe: raw?.universe,
     generated_at: raw?.meta?.generated_at || raw?.timestamp,
-    raw
+    raw // pass-through in case downstream needs the original
   };
 }
 
@@ -347,6 +368,105 @@ export async function runAgent(agentId, ticker = null) {
 
 export async function getCalendar(weeks = 2) {
   return signaFetch(`/api/calendar?weeks=${weeks}`);
+}
+
+// ============================================================
+// runBacktest — POST /api/v1/backtest
+//
+// IMPORTANT: Despite documentation hints, this endpoint does NOT filter
+// signals by agent — `agent`, `agentId`, `strategy`, `agents[]`, and
+// `signalThreshold` are all silently ignored. The endpoint is a generic
+// signal-driven trade simulator.
+//
+// To get real multi-trade results (not just buy-and-hold), you MUST
+// pass `stopLoss`, `takeProfit`, and `holdingPeriod`. Otherwise the
+// engine returns one buy-at-first-signal/exit-at-end-of-period trade,
+// which produces meaningless win-rate/Sharpe/drawdown stats.
+//
+// Window cannot exceed 5 years. We cap at 4 years 11 months to be safe.
+//
+// Required Signa params:
+//   - symbol         e.g. "NVDA"
+//   - startDate      ISO date "YYYY-MM-DD"
+//   - endDate        ISO date "YYYY-MM-DD"
+//   - initialCapital positive number
+//   - positionSize   number 0–1 (e.g. 0.1 = 10%)
+//
+// Recommended (or you get a single-trade result):
+//   - stopLoss       e.g. 0.05 = 5% stop
+//   - takeProfit     e.g. 0.10 = 10% target
+//   - holdingPeriod  e.g. 30   = max 30-day hold
+// ============================================================
+
+const MAX_BACKTEST_DAYS = 4 * 365 + 11 * 30; // ~4 years 11 months
+
+export async function runBacktest({
+  symbol,
+  startDate,
+  endDate,
+  initialCapital = 100000,
+  positionSize = 0.1,
+  stopLoss = 0.05,
+  takeProfit = 0.10,
+  holdingPeriod = 30
+} = {}) {
+  if (!symbol) throw new Error('runBacktest: symbol is required');
+  if (!startDate || !endDate) throw new Error('runBacktest: startDate and endDate are required (ISO YYYY-MM-DD)');
+
+  // Defensive clamp on window length so we never trip the 5y cap.
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  if (isNaN(start) || isNaN(end)) {
+    throw new Error('runBacktest: startDate/endDate must be valid YYYY-MM-DD');
+  }
+  const days = Math.round((end - start) / (1000 * 60 * 60 * 24));
+  if (days > MAX_BACKTEST_DAYS) {
+    const newStart = new Date(end.getTime() - MAX_BACKTEST_DAYS * 24 * 60 * 60 * 1000);
+    startDate = newStart.toISOString().slice(0, 10);
+  }
+  if (days < 30) {
+    throw new Error('runBacktest: window too short (need at least 30 days)');
+  }
+
+  // Validate position size + capital (Signa enforces these)
+  if (positionSize <= 0 || positionSize > 1) {
+    throw new Error('runBacktest: positionSize must be between 0 and 1');
+  }
+  if (initialCapital <= 0) {
+    throw new Error('runBacktest: initialCapital must be a positive number');
+  }
+
+  const body = {
+    symbol: String(symbol).toUpperCase(),
+    startDate,
+    endDate,
+    initialCapital,
+    positionSize,
+    stopLoss,
+    takeProfit,
+    holdingPeriod
+  };
+
+  const raw = await signaFetch('/api/v1/backtest', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+
+  // Normalize response — Signa returns { ok, backtest: { config, summary, equity, trades, ... } }
+  const bt = raw?.backtest || raw;
+  if (!bt?.summary) {
+    throw new Error('runBacktest: unexpected response shape — no summary field');
+  }
+
+  return {
+    config: bt.config || body,
+    summary: bt.summary,
+    equity: Array.isArray(bt.equity) ? bt.equity : [],
+    trades: Array.isArray(bt.trades) ? bt.trades : [],
+    monthlyReturns: Array.isArray(bt.monthlyReturns) ? bt.monthlyReturns : [],
+    monteCarlo: bt.monteCarlo || null,
+    raw
+  };
 }
 
 // ============================================================

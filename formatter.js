@@ -974,6 +974,155 @@ function buildEarningsFallback(ticker, earnings, quote, minutesBefore) {
 }
 
 // ============================================================
+// Backtest result (Phase 2 Feature 3)
+//
+// Embed shows: win rate, Sharpe, Sortino, max DD, total return,
+// profit factor, trade count + SPY benchmark side-by-side for context.
+// Includes honest disclosure of exit rules used.
+// ============================================================
+
+function fmtNum(n, digits = 2, suffix = '') {
+  if (n == null || isNaN(n)) return '—';
+  return Number(n).toFixed(digits) + suffix;
+}
+
+function pickPriceFor(equityArr, when = 'end') {
+  if (!Array.isArray(equityArr) || equityArr.length === 0) return null;
+  return when === 'start' ? equityArr[0]?.value : equityArr[equityArr.length - 1]?.value;
+}
+
+// Compute SPY-equivalent buy-and-hold return for the same window.
+// We can't run a separate backtest call here (caller decides), so this
+// expects a `spyBacktest` arg that the caller has already fetched.
+export function buildBacktestResult(symbol, backtest, opts = {}) {
+  if (!backtest?.summary) {
+    return null;
+  }
+  const s = backtest.summary;
+  const cfg = backtest.config || {};
+  const spy = opts.spyBacktest || null; // optional SPY backtest for benchmark
+
+  // Derive percentages — Signa returns winRate as 0-1, returns as %.
+  const winRatePct = s.winRate != null ? Math.round(s.winRate * 100) : null;
+  const totalReturnPct = s.totalReturnPercent;
+  const annualizedPct = s.annualizedReturn;
+  const maxDDPct = s.maxDrawdownPercent;
+  const sharpe = s.sharpeRatio;
+  const sortino = s.sortinoRatio;
+  const profitFactor = s.profitFactor;
+
+  // Profitable strategy? Profit factor > 1 AND positive total return.
+  const isProfitable = (profitFactor > 1) && (totalReturnPct > 0);
+  const color = isProfitable ? 0x00FF88 : (totalReturnPct < 0 ? 0xFF4444 : 0xFFCC00);
+
+  // SPY benchmark — strategy alpha vs market
+  let spyTotalReturn = null;
+  let alphaPct = null;
+  if (spy?.summary?.totalReturnPercent != null) {
+    spyTotalReturn = spy.summary.totalReturnPercent;
+    alphaPct = totalReturnPct - spyTotalReturn;
+  }
+
+  // Build header
+  const headerLines = [
+    `**Strategy:** Signa signals + ${fmtNum(cfg.stopLoss * 100, 0)}% stop / ${fmtNum(cfg.takeProfit * 100, 0)}% target / ${cfg.holdingPeriod}d max hold`,
+    `**Window:** \`${(cfg.startDate || '').slice(0, 10)}\` → \`${(cfg.endDate || '').slice(0, 10)}\` (${s.totalDays || '?'} days)`,
+    `**Capital:** ${fmtMoney(cfg.initialCapital)}  ·  **Position size:** ${fmtNum(cfg.positionSize * 100, 0)}%`
+  ];
+
+  // Core stats block — readable, mono-aligned
+  const coreStats = [
+    `📈 **Win Rate:**       \`${winRatePct != null ? winRatePct + '%' : '—'}\` (${s.winningTrades || 0}W / ${s.losingTrades || 0}L · ${s.totalTrades || 0} trades)`,
+    `💰 **Total Return:**   \`${fmtNum(totalReturnPct, 2, '%')}\``,
+    `📊 **Annualized:**     \`${fmtNum(annualizedPct, 2, '%')}\``,
+    `📉 **Max Drawdown:**   \`${fmtNum(maxDDPct, 2, '%')}\``,
+    `⚡ **Sharpe Ratio:**   \`${fmtNum(sharpe, 2)}\``,
+    `🎯 **Profit Factor:**  \`${fmtNum(profitFactor, 2)}\` (need > 1.0 to be profitable)`,
+    `⏱️  **Avg Holding:**    \`${fmtNum(s.avgHoldingDays, 1)} days\``
+  ];
+
+  const fields = [
+    {
+      name: '📋 Backtest Configuration',
+      value: headerLines.join('\n'),
+      inline: false
+    },
+    {
+      name: '📊 Performance',
+      value: coreStats.join('\n'),
+      inline: false
+    }
+  ];
+
+  // SPY benchmark row
+  if (spyTotalReturn != null) {
+    const alphaSign = alphaPct >= 0 ? '+' : '';
+    const alphaEmoji = alphaPct >= 0 ? '🟢' : '🔴';
+    fields.push({
+      name: '🆚 vs SPY (Buy & Hold Benchmark)',
+      value: [
+        `${symbol} strategy:  \`${fmtNum(totalReturnPct, 2, '%')}\``,
+        `SPY benchmark:  \`${fmtNum(spyTotalReturn, 2, '%')}\` (same window)`,
+        `${alphaEmoji} **Alpha:** \`${alphaSign}${fmtNum(alphaPct, 2, ' pp')}\``
+      ].join('\n'),
+      inline: false
+    });
+  }
+
+  // Win/loss size (useful for risk-adjusting reads)
+  if (s.avgWin != null || s.avgLoss != null) {
+    fields.push({
+      name: '💵 Trade Sizes',
+      value: [
+        `Avg win: \`${fmtMoney(s.avgWin)}\``,
+        `Avg loss: \`${fmtMoney(s.avgLoss)}\``,
+        s.expectedValue != null ? `Expected value per trade: \`${fmtNum(s.expectedValue, 2, '%')}\`` : null
+      ].filter(Boolean).join('  ·  '),
+      inline: false
+    });
+  }
+
+  // Verdict — content-friendly summary
+  let verdict = '';
+  if (isProfitable && alphaPct != null && alphaPct > 0) {
+    verdict = `✅ **Strategy beat the market** with ${fmtNum(alphaPct, 1, ' pp')} of alpha and a positive profit factor.`;
+  } else if (isProfitable) {
+    verdict = `🟡 **Strategy was profitable** but underperformed buy & hold by ${fmtNum(Math.abs(alphaPct ?? 0), 1, ' pp')}.`;
+  } else if (totalReturnPct >= 0) {
+    verdict = `🟡 **Marginal returns** — profit factor below 1.0 means losses outweighed wins despite total return.`;
+  } else {
+    verdict = `🔴 **Strategy lost money.** With these exit rules, ${symbol} was unprofitable over this window${alphaPct != null ? ` (vs SPY ${fmtNum(spyTotalReturn, 1, '%')})` : ''}.`;
+  }
+
+  fields.push({
+    name: '💬 Verdict',
+    value: verdict,
+    inline: false
+  });
+
+  // Honest caveat about endpoint behavior
+  fields.push({
+    name: '⚠️  Disclosure',
+    value: [
+      `The Signa backtest endpoint applies its full signal stream to ${symbol} with the chosen exits — it is NOT a single-agent backtest.`,
+      `Different exit rules will produce dramatically different results.`,
+      `Past performance ≠ future returns.`
+    ].join(' '),
+    inline: false
+  });
+
+  const embed = {
+    title: `📊 ${symbol} — Backtest Result`,
+    color,
+    fields,
+    footer: FOOTER,
+    timestamp: new Date().toISOString()
+  };
+
+  return { embeds: fitMessage([embed]) };
+}
+
+// ============================================================
 // Startup confirmation
 // ============================================================
 
