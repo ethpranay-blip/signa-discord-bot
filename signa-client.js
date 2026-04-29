@@ -458,8 +458,14 @@ export async function runBacktest({
     throw new Error('runBacktest: unexpected response shape — no summary field');
   }
 
+  // Merge request params with response config — Signa drops some fields
+  // (notably holdingPeriod) from the response, so we use what we sent
+  // as the source of truth for display.
+  const mergedConfig = { ...body, ...(bt.config || {}) };
+  if (body.holdingPeriod != null) mergedConfig.holdingPeriod = body.holdingPeriod;
+
   return {
-    config: bt.config || body,
+    config: mergedConfig,
     summary: bt.summary,
     equity: Array.isArray(bt.equity) ? bt.equity : [],
     trades: Array.isArray(bt.trades) ? bt.trades : [],

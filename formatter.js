@@ -1025,7 +1025,7 @@ export function buildBacktestResult(symbol, backtest, opts = {}) {
 
   // Build header
   const headerLines = [
-    `**Strategy:** Signa signals + ${fmtNum(cfg.stopLoss * 100, 0)}% stop / ${fmtNum(cfg.takeProfit * 100, 0)}% target / ${cfg.holdingPeriod}d max hold`,
+    `**Strategy:** Signa signals + ${fmtNum(cfg.stopLoss * 100, 0)}% stop / ${fmtNum(cfg.takeProfit * 100, 0)}% target / ${cfg.holdingPeriod || '?'}d max hold`,
     `**Window:** \`${(cfg.startDate || '').slice(0, 10)}\` → \`${(cfg.endDate || '').slice(0, 10)}\` (${s.totalDays || '?'} days)`,
     `**Capital:** ${fmtMoney(cfg.initialCapital)}  ·  **Position size:** ${fmtNum(cfg.positionSize * 100, 0)}%`
   ];
