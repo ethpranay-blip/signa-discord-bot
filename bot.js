@@ -277,6 +277,52 @@ async function emitEnrichedTier3Alert(tier3, allScored, signalIndex, jobLabel) {
   return null;
 }
 
+// Detect 503/nightly_pipeline_pending from a getSignalIndex() rejection.
+// Returns true if the error looks like the pipeline wasn't ready yet.
+function isPipelinePendingError(reason) {
+  const msg = String(reason?.message || reason || '');
+  if (msg.includes('503')) return true;
+  if (msg.toLowerCase().includes('nightly_pipeline_pending')) return true;
+  if (msg.toLowerCase().includes('pipeline_pending')) return true;
+  return false;
+}
+
+// One-shot retry of /signal-index 5 min after the digest. Updates
+// state.lastRegime and posts a regime-change alert if the regime shifted
+// from yesterday's. No-op for non-503 failures.
+let _signalIndexRetryPending = false;
+function scheduleSignalIndexRetry(reason) {
+  if (!isPipelinePendingError(reason)) return false;
+  if (_signalIndexRetryPending) {
+    log(`  signal-index retry already pending — not scheduling another`);
+    return false;
+  }
+  _signalIndexRetryPending = true;
+  const delayMs = 5 * 60 * 1000;
+  log(`⏳ signal-index 503 (pipeline pending) — retrying in 5 min`);
+
+  setTimeout(async () => {
+    try {
+      const idx = await getSignalIndex();
+      if (!idx?.regime) {
+        log('🔄 signal-index retry: no regime in response, skipping');
+        return;
+      }
+      log(`🔄 signal-index retry succeeded — regime ${idx.regime}`);
+      if (state.lastRegime && state.lastRegime !== idx.regime) {
+        const change = buildRegimeChange(state.lastRegime, idx.regime);
+        await postToDiscord(route('macro'), change, 'regime-change-retry');
+      }
+      state.lastRegime = idx.regime;
+    } catch (err) {
+      logErr(`❌ signal-index retry failed: ${err.message}`);
+    } finally {
+      _signalIndexRetryPending = false;
+    }
+  }, delayMs);
+  return true;
+}
+
 // ============================================================
 // JOB 1 — Nightly digest
 // ============================================================
@@ -312,6 +358,13 @@ async function runNightlyDigest() {
     ['screener', screenerRes]
   ]) {
     if (r.status === 'rejected') logErr(`  ⚠️  ${name} failed: ${r.reason?.message || r.reason}`);
+  }
+
+  // The 21:30 digest sometimes races Signa's nightly pipeline. If
+  // /signal-index returned 503/nightly_pipeline_pending, schedule a single
+  // retry 5 min later so the regime baseline + regime-change alert still fire.
+  if (signalIndexRes.status === 'rejected') {
+    scheduleSignalIndexRetry(signalIndexRes.reason);
   }
 
   // Regime change detection
