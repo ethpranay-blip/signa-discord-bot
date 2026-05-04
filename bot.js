@@ -674,19 +674,24 @@ export async function runBacktestForTicker(ticker, options = {}) {
 // metric we use.)
 // ============================================================
 
-const CONSENSUS_MIN_MODELS = 4;
-const CONSENSUS_MIN_SCORE = 75;
+const CONSENSUS_MIN_MODELS = 5;
+const CONSENSUS_MIN_SCORE = 80;
+const CONSENSUS_MAX_PER_DAY = 1;
 
-// State: track which (ticker, direction) we've alerted on today.
+// State: track which (ticker, direction) we've alerted on today,
+// plus a global daily counter so we cap @here pings at
+// CONSENSUS_MAX_PER_DAY regardless of how many candidates pass the gate.
 const consensusAlertState = {
   lastResetDay: null,
-  alerted: new Set() // keys like "NVDA:BULLISH"
+  alerted: new Set(), // keys like "NVDA:BULLISH"
+  firedToday: 0
 };
 
 function resetConsensusStateIfNewDay() {
   const today = new Date().toLocaleDateString('en-CA', { timeZone: TZ });
   if (consensusAlertState.lastResetDay !== today) {
     consensusAlertState.alerted.clear();
+    consensusAlertState.firedToday = 0;
     consensusAlertState.lastResetDay = today;
     log(`🔄 Consensus tracker reset for ${today}`);
   }
@@ -734,12 +739,22 @@ async function runConsensusCheck(opts = {}) {
     return;
   }
 
+  // Sort by composite_score descending so the single daily alert
+  // (capped at CONSENSUS_MAX_PER_DAY) goes to the strongest candidate,
+  // not whichever the API returned first.
+  candidates.sort((a, b) => (b.composite_score || 0) - (a.composite_score || 0));
+
   log(`  Found ${candidates.length} consensus candidate(s) of ${rows.length} scored rows. Building alerts…`);
 
   let firedCount = 0;
   for (const row of candidates) {
     const ticker = String(row.ticker || '').toUpperCase();
     if (!ticker) continue;
+
+    if (consensusAlertState.firedToday >= CONSENSUS_MAX_PER_DAY && !opts.force) {
+      log(`    ${ticker} ${row.direction}: daily cap reached (${CONSENSUS_MAX_PER_DAY}) — skipping remaining ${candidates.length - firedCount} candidate(s)`);
+      break;
+    }
 
     const alertKey = `${ticker}:${row.direction}`;
     if (consensusAlertState.alerted.has(alertKey) && !opts.force) {
@@ -766,6 +781,7 @@ async function runConsensusCheck(opts = {}) {
     const ok = await postToDiscord(route('signals'), payload, `consensus-${ticker}`);
     if (ok) {
       consensusAlertState.alerted.add(alertKey);
+      consensusAlertState.firedToday++;
       firedCount++;
     }
   }
@@ -839,7 +855,7 @@ async function startup() {
   if (ENABLE_PREMARKET)     log(`  🌅 Pre-market brief    09:00 ET           Mon–Fri    → #signals`);
   log(`  🌊 Dark pool sweep     :00/:30 9am-4pm ET   Mon–Fri    → #micro`);
   log(`  📊 Earnings tracker    every 5 min 7am-7pm  Mon–Fri    → #earnings`);
-  log(`  🎯 Multi-model consensus 21:35 ET           Mon–Fri    → #signals (≥${CONSENSUS_MIN_MODELS} models, score ≥${CONSENSUS_MIN_SCORE})`);
+  log(`  🎯 Multi-model consensus 21:35 ET           Mon–Fri    → #signals (≥${CONSENSUS_MIN_MODELS} models, score ≥${CONSENSUS_MIN_SCORE}, max ${CONSENSUS_MAX_PER_DAY}/day)`);
   log('');
 
   // Schedule jobs
