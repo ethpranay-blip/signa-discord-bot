@@ -794,11 +794,15 @@ function extractActionCardData(actionCard) {
 }
 
 function formatDriver(drv) {
+  if (drv == null) return '';
   if (typeof drv === 'string') return trunc(drv, 90);
+  if (typeof drv !== 'object') return trunc(String(drv), 90);
   const name = drv.name ?? drv.indicator ?? drv.driver ?? drv.label ?? '';
-  const value = drv.value ?? drv.note ?? drv.detail ?? '';
+  const value = drv.description ?? drv.value ?? drv.note ?? drv.detail ?? drv.summary ?? '';
   if (name && value) return `${trunc(name, 30)} — ${trunc(String(value), 60)}`;
-  return trunc(name || JSON.stringify(drv), 90);
+  if (name) return trunc(String(name), 90);
+  if (value) return trunc(String(value), 90);
+  return trunc(JSON.stringify(drv), 90);
 }
 
 // 60-min full Action Card
@@ -844,7 +848,7 @@ export function buildEarningsActionCard60(ticker, actionCard, earnings, quote) {
   } else if (data.reasons.length > 0) {
     fields.push({
       name: '✅ Key Drivers',
-      value: data.reasons.map((r, i) => `${i + 1}. ${trunc(r, 90)}`).join('\n'),
+      value: data.reasons.map((r, i) => `${i + 1}. ${formatDriver(r)}`).join('\n'),
       inline: false
     });
   }
