@@ -442,7 +442,7 @@ export function buildTier3Alert(signals, opts = {}) {
     if (drivers.length > 0) {
       fields.push({
         name: 'Key Drivers',
-        value: drivers.map((d, i) => `${i + 1}. ${trunc(d, 120)}`).join('\n'),
+        value: drivers.map((d, i) => `${i + 1}. ${formatDriver(d)}`).join('\n'),
         inline: false
       });
     }
@@ -575,7 +575,7 @@ export function buildTickerAlert(ticker, signalData, enhancedData) {
   if (drivers.length > 0) {
     fields.push({
       name: 'Key Drivers',
-      value: drivers.slice(0, 5).map((d, i) => `${i + 1}. ${trunc(d, 150)}`).join('\n'),
+      value: drivers.slice(0, 5).map((d, i) => `${i + 1}. ${formatDriver(d)}`).join('\n'),
       inline: false
     });
   }
