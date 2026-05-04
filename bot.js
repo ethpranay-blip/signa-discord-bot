@@ -402,6 +402,10 @@ async function runPremarketBrief() {
 // JOB 4 — Dark pool anomaly check (every 30 min market hours)
 // ============================================================
 
+// Minimum dollar volume on the dominant side before a dark pool alert
+// is worth firing. Sub-$10M flips are routine market noise.
+const DARKPOOL_MIN_DOLLAR_VOLUME = 10_000_000;
+
 async function runDarkpoolCheck() {
   try {
     const dp = await getDarkPool(DARKPOOL_TICKER, 100);
@@ -414,15 +418,20 @@ async function runDarkpoolCheck() {
 
     const aggressorChanged = state.lastDarkpoolAggressor !== null
       && state.lastDarkpoolAggressor !== agg;
-    const sellImbalance = sell > buy * 10 && sell > 0;
-    const buyImbalance = buy > sell * 10 && buy > 0;
+    const meetsThreshold = Math.max(buy, sell) >= DARKPOOL_MIN_DOLLAR_VOLUME;
 
-    const shouldAlert = aggressorChanged || sellImbalance || buyImbalance;
+    // Only fire on a true aggressor flip backed by meaningful dollar volume.
+    // SELL→SELL (or any same-side repeat) is suppressed because the imbalance
+    // direction has not changed, and sub-threshold flips are market noise.
+    const shouldAlert = aggressorChanged && meetsThreshold;
 
     if (shouldAlert) {
       log(`🌊 Dark pool anomaly: ${state.lastDarkpoolAggressor || '—'} → ${agg}, buy=${buy}, sell=${sell}`);
       const alert = buildDarkPoolAlert(summary, DARKPOOL_TICKER);
       if (alert) await postToDiscord(route('micro'), alert, 'darkpool-anomaly');
+    } else if (state.lastDarkpoolAggressor !== null && (aggressorChanged || meetsThreshold)) {
+      // Diagnostic: log near-misses so we can tune the threshold later.
+      log(`🌊 Dark pool noise: ${state.lastDarkpoolAggressor} → ${agg}, buy=${buy}, sell=${sell} — suppressed (changed=${aggressorChanged}, threshold=${meetsThreshold})`);
     }
     state.lastDarkpoolAggressor = agg;
   } catch (err) {
