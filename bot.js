@@ -38,6 +38,8 @@ import {
   buildConsensusAlert
 } from './formatter.js';
 
+import { startDiscordBot } from './discord-bot.js';
+
 // --- Environment ---
 const SIGNA_API_KEY = process.env.SIGNA_API_KEY;
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
@@ -943,6 +945,14 @@ async function startup() {
   const nextDigest = `${fmtCron(DIGEST_MINUTE, DIGEST_HOUR)} (Mon–Fri)`;
   const startupPayload = buildStartupNotice(me, nextDigest, WATCHLIST.length);
   await postToDiscord(route('signals'), startupPayload, 'startup');
+
+  // Discord Gateway bot for slash commands. Failure here MUST NOT crash
+  // the cron bot — webhooks keep working without the gateway.
+  try {
+    await startDiscordBot();
+  } catch (err) {
+    logErr(`Discord bot failed to start (cron jobs unaffected): ${err.message}`);
+  }
 
   log('Bot is running. Press Ctrl+C to stop.\n');
 }

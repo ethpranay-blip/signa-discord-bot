@@ -1288,6 +1288,98 @@ export function buildConsensusAlert(scoredRow, opts = {}) {
 }
 
 // ============================================================
+// /signa slash command response — full Action Card embed
+// ============================================================
+
+export function buildSignaSlashResponse(ticker, actionCard, quote) {
+  const data = extractActionCardData(actionCard);
+  if (!data) return null;
+
+  const dir = data.direction || 'NEUTRAL';
+  const color = DIR_COLOR[dir] ?? DIR_COLOR.NEUTRAL;
+  const dEmoji = DIR_EMOJI[dir] || '·';
+  const gEmoji = GRADE_EMOJI[data.grade?.[0]] || '·';
+
+  const price = quote?.price != null ? fmtPrice(quote.price) : null;
+  const change = quote?.change_pct != null
+    ? (Number(quote.change_pct) >= 0
+        ? `+${Number(quote.change_pct).toFixed(2)}%`
+        : `${Number(quote.change_pct).toFixed(2)}%`)
+    : null;
+
+  // RISK_ON full · TRANSITIONAL 0.65× · RISK_OFF 0.35× longs
+  const sizeByRegime = (regime) => {
+    const r = String(regime || '').toUpperCase();
+    if (r === 'RISK_ON')      return 'full size';
+    if (r === 'TRANSITIONAL') return '0.65× longs';
+    if (r === 'RISK_OFF')     return '0.35× longs';
+    return null;
+  };
+  const sizingLabel = sizeByRegime(data.regime);
+
+  const headerLines = [
+    `${gEmoji} **Grade ${data.grade}**  ·  Score \`${data.score ?? '—'}/100\`  ·  ${dEmoji} **${dir}**`,
+    price ? `**Last:** ${price}${change ? `  (${change})` : ''}` : null,
+    data.totalDrivers
+      ? `**Driver consensus:** ${data.bullishCount}/${data.totalDrivers} bullish · ${data.bearishCount}/${data.totalDrivers} bearish`
+      : null,
+    data.regime
+      ? `**Regime:** ${data.regime}${sizingLabel ? ` · ${sizingLabel}` : ''}${data.sizeMultiplier != null ? ` (signal × ${data.sizeMultiplier})` : ''}`
+      : null,
+    data.confidence != null ? `**Confidence:** ${Math.round(Number(data.confidence) * (data.confidence <= 1 ? 100 : 1))}%` : null
+  ].filter(Boolean);
+
+  const fields = [];
+
+  if (data.bullishDrivers.length > 0) {
+    fields.push({
+      name: '✅ Top Bullish Drivers',
+      value: data.bullishDrivers.map((d, i) => `${i + 1}. ${formatDriver(d)}`).join('\n'),
+      inline: false
+    });
+  } else if (data.reasons.length > 0) {
+    fields.push({
+      name: '✅ Key Drivers',
+      value: data.reasons.map((r, i) => `${i + 1}. ${formatDriver(r)}`).join('\n'),
+      inline: false
+    });
+  }
+
+  if (data.bearishDrivers.length > 0) {
+    fields.push({
+      name: '⚠️  Counter-signals',
+      value: data.bearishDrivers.map((d, i) => `${i + 1}. ${formatDriver(d)}`).join('\n'),
+      inline: false
+    });
+  }
+
+  const posLines = [];
+  if (data.entry  != null) posLines.push(`Entry \`${fmtPrice(data.entry)}\``);
+  if (data.stop   != null) posLines.push(`Stop \`${fmtPrice(data.stop)}\``);
+  if (data.target != null) posLines.push(`Target \`${fmtPrice(data.target)}\``);
+  if (data.suggestedSize != null && data.suggestedSize > 0) posLines.push(`Size \`${data.suggestedSize}%\``);
+  if (posLines.length > 0) {
+    fields.push({
+      name: '📍 Position Guide',
+      value: posLines.join('  ·  '),
+      inline: false
+    });
+  }
+
+  const titleSuffix = price ? `  ·  ${price}${change ? `  (${change})` : ''}` : '';
+  const embed = {
+    title: `${dEmoji} ${ticker} — ${dir} · Grade ${data.grade}${titleSuffix}`,
+    description: headerLines.join('\n'),
+    color,
+    fields,
+    footer: FOOTER,
+    timestamp: new Date().toISOString()
+  };
+
+  return { embeds: fitMessage([embed]) };
+}
+
+// ============================================================
 // Startup confirmation
 // ============================================================
 
