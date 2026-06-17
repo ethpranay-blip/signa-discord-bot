@@ -20,6 +20,7 @@ import {
   getSignalIndex,
   getSignal,
   getGex,
+  isGexPlausible,
   getQuote,
   scan,
   screenTickers
@@ -254,14 +255,41 @@ function computeVerdict(signalData, spyGex) {
   const gate3 = ['LONG', 'SHORT'].includes(intendedDir);
   const gate4 = Number(signa.flowScore ?? 0) > 65;
 
-  const regimeAbove = spyGex?.levels?.regimeAboveFlip;
-  const gate5 = (intendedDir === 'LONG'  && regimeAbove === true)
-             || (intendedDir === 'SHORT' && regimeAbove === false);
+  // Gate 5 — regime alignment. Callers pass null for spyGex when the
+  // upstream read failed the plausibility check; in that case we record
+  // 'unavailable' (a non-boolean) so the card renders ⚠️ instead of ❌
+  // and the verdict can never reach CALL (CALL requires gate5 === true).
+  let gate5;
+  if (!spyGex || !spyGex.levels || typeof spyGex.levels.regimeAboveFlip !== 'boolean') {
+    gate5 = 'unavailable';
+  } else {
+    const regimeAbove = spyGex.levels.regimeAboveFlip;
+    gate5 = (intendedDir === 'LONG'  && regimeAbove === true)
+         || (intendedDir === 'SHORT' && regimeAbove === false);
+  }
 
   const gate6 = data.stop != null && data.target != null;
 
-  const verdict = (gate1 && gate2 && gate3 && gate4 && gate5 && gate6) ? 'CALL' : 'NO-CALL';
+  const verdict = (gate1 && gate2 && gate3 && gate4 && gate5 === true && gate6) ? 'CALL' : 'NO-CALL';
   return { verdict, gates: { gate1, gate2, gate3, gate4, gate5, gate6 }, engineFresh };
+}
+
+// sanitizeGex — wrap a getGex() result. Returns the raw GEX response if
+// it passes the plausibility check; otherwise logs a warning with the
+// upstream request_id and returns null. All call sites that consume
+// SPY/QQQ GEX must pipe through this so a corrupted flip never reaches
+// a regime card or gate-5 evaluation.
+function sanitizeGex(raw, label) {
+  if (!raw) return null;
+  if (isGexPlausible(raw)) return raw;
+  const lv = raw?.levels ?? {};
+  const reqId = raw.__requestId || 'n/a';
+  logErr(
+    `⚠️  GEX/${label} implausible (request_id=${reqId}): ` +
+    `flip=${lv.gammaFlipLevel} callWall=${lv.callWall} putWall=${lv.putWall} ` +
+    `— treating GEX as unavailable this cycle, suppressing regime publish.`
+  );
+  return null;
 }
 
 // ============================================================
@@ -339,9 +367,11 @@ async function runHourlyScan() {
 
   // 2. GEX — SPY primary, QQQ confirmation
   const [spyRes, qqqRes] = await Promise.allSettled([getGex('SPY'), getGex('QQQ')]);
-  const spyGex = spyRes.status === 'fulfilled' ? spyRes.value : null;
-  const qqqGex = qqqRes.status === 'fulfilled' ? qqqRes.value : null;
-  if (!spyGex) logErr(`  ⚠️  GEX/SPY failed: ${spyRes.reason?.message}`);
+  const spyRaw = spyRes.status === 'fulfilled' ? spyRes.value : null;
+  const qqqRaw = qqqRes.status === 'fulfilled' ? qqqRes.value : null;
+  if (!spyRaw) logErr(`  ⚠️  GEX/SPY failed: ${spyRes.reason?.message}`);
+  const spyGex = sanitizeGex(spyRaw, 'SPY');
+  const qqqGex = sanitizeGex(qqqRaw, 'QQQ');
 
   // 3. Compute verdicts
   const allResults = [];
@@ -409,7 +439,8 @@ async function runNightlyDigest() {
   ]);
 
   const signalIndex = signalIndexRes.status === 'fulfilled' ? signalIndexRes.value : null;
-  const spyGex      = spyGexRes.status      === 'fulfilled' ? spyGexRes.value      : null;
+  const spyRaw      = spyGexRes.status      === 'fulfilled' ? spyGexRes.value      : null;
+  const spyGex      = sanitizeGex(spyRaw, 'SPY');
 
   if (signalIndexRes.status === 'rejected') {
     logErr(`  ⚠️  signal-index failed: ${signalIndexRes.reason?.message}`);
@@ -452,8 +483,10 @@ async function runPremarketBrief() {
     ]);
 
     const signalIndex = signalIndexRes.status === 'fulfilled' ? signalIndexRes.value : null;
-    const spyGex      = spyGexRes.status      === 'fulfilled' ? spyGexRes.value      : null;
-    const qqqGex      = qqqGexRes.status      === 'fulfilled' ? qqqGexRes.value      : null;
+    const spyRaw      = spyGexRes.status      === 'fulfilled' ? spyGexRes.value      : null;
+    const qqqRaw      = qqqGexRes.status      === 'fulfilled' ? qqqGexRes.value      : null;
+    const spyGex      = sanitizeGex(spyRaw, 'SPY');
+    const qqqGex      = sanitizeGex(qqqRaw, 'QQQ');
     const screener    = screenerRes.status     === 'fulfilled' ? screenerRes.value    : null;
 
     for (const [name, r] of [
@@ -515,7 +548,8 @@ export async function lookupTicker(ticker) {
 
   const signal = signalRes.status === 'fulfilled' ? signalRes.value : null;
   const quote  = quoteRes.status  === 'fulfilled' ? quoteRes.value  : null;
-  const gex    = gexRes.status    === 'fulfilled' ? gexRes.value    : null;
+  const gexRaw = gexRes.status    === 'fulfilled' ? gexRes.value    : null;
+  const gex    = sanitizeGex(gexRaw, t);
 
   if (!signal && !quote) {
     logErr(`  No data for ${t}`);
@@ -698,7 +732,8 @@ if (cliArgs.includes('--dry-run')) {
   console.log(`\n[${ts()}] Dry run — fetching ${testTicker} signal + SPY GEX…\n`);
   (async () => {
     try {
-      const [sig, spyGex] = await Promise.all([getSignal(testTicker), getGex('SPY')]);
+      const [sig, spyRaw] = await Promise.all([getSignal(testTicker), getGex('SPY')]);
+      const spyGex = sanitizeGex(spyRaw, 'SPY');
       const verdict = computeVerdict(sig, spyGex);
 
       console.log(`\n=== ${testTicker} — signa surface ===`);
@@ -706,12 +741,16 @@ if (cliArgs.includes('--dry-run')) {
       console.log(`\n=== ${testTicker} — data surface ===`);
       console.log(JSON.stringify(sig?.data || {}, null, 2).slice(0, 600));
       console.log('\n=== SPY GEX levels ===');
-      console.log(JSON.stringify(spyGex?.levels || spyGex, null, 2).slice(0, 600));
+      console.log(spyGex
+        ? JSON.stringify(spyGex?.levels || spyGex, null, 2).slice(0, 600)
+        : `(unavailable — raw: ${JSON.stringify(spyRaw?.levels || spyRaw, null, 2).slice(0, 300)})`);
       console.log('\n=== Verdict ===');
       console.log(`VERDICT: ${verdict.verdict}`);
       for (let i = 1; i <= 6; i++) {
         const g = `gate${i}`;
-        console.log(`  ${verdict.gates[g] ? '✅' : '❌'} ${g}`);
+        const v = verdict.gates[g];
+        const mark = v === true ? '✅' : v === 'unavailable' ? '⚠️ ' : '❌';
+        console.log(`  ${mark} ${g}${v === 'unavailable' ? ' (unavailable)' : ''}`);
       }
       console.log('\n✓ Dry run complete — no Discord posts made.\n');
       process.exit(0);
@@ -742,9 +781,10 @@ if (cliArgs.includes('--dry-run')) {
   console.log(`\n[${ts()}] Post-test — ${testTicker} → DISCORD_TEST_WEBHOOK_URL\n`);
   (async () => {
     try {
-      const [sig, spyGex] = await Promise.all([getSignal(testTicker), getGex('SPY')]);
+      const [sig, spyRaw] = await Promise.all([getSignal(testTicker), getGex('SPY')]);
+      const spyGex = sanitizeGex(spyRaw, 'SPY');
       const verdict = computeVerdict(sig, spyGex);
-      console.log(`Verdict: ${verdict.verdict}`);
+      console.log(`Verdict: ${verdict.verdict}  (gate5=${verdict.gates.gate5})`);
       const card = buildCallCard(testTicker, sig, spyGex, verdict, { isPreview: true });
       if (!card) {
         console.error('\n❌ buildCallCard returned empty payload — nothing to post.\n');

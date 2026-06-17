@@ -50,7 +50,7 @@ Open `.env` and fill in at minimum:
 ```ini
 SIGNA_API_KEY=cmts_your_actual_key
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/…
-WATCHLIST=NVDA,AAPL,MSFT,GOOGL,AMZN,SPY,QQQ,META,TSLA,BRK.B
+WATCHLIST=NVDA,AAPL,MSFT,GOOGL,AMZN,SPY,QQQ,META,TSLA
 ```
 
 All other variables have sensible defaults. See `.env.example` for the full list.

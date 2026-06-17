@@ -82,11 +82,24 @@ async function signaFetch(path, options = {}) {
     }
 
     if (res.ok) {
+      let body;
       try {
-        return await res.json();
+        body = await res.json();
       } catch (parseErr) {
         throw new Error(`Signa returned non-JSON for ${path}: ${parseErr.message}`);
       }
+      // Attach the upstream request id as a non-enumerable property so existing
+      // callers see no behavior change but callers that need it (e.g. getGex
+      // logging an implausible flip) can read body.__requestId.
+      const reqId = res.headers.get('x-request-id')
+                 || res.headers.get('x-amzn-trace-id')
+                 || res.headers.get('request-id')
+                 || null;
+      if (reqId && body && typeof body === 'object') {
+        try { Object.defineProperty(body, '__requestId', { value: reqId, enumerable: false }); }
+        catch { /* frozen/sealed — ignore */ }
+      }
+      return body;
     }
 
     // Auth-style errors — never retry, give a precise message
@@ -201,6 +214,27 @@ export async function getSignal(ticker) {
 export async function getGex(symbol) {
   if (!symbol) throw new Error('getGex: symbol is required');
   return signaFetch(`/api/v1/gex/${encodeURIComponent(String(symbol).toUpperCase())}`);
+}
+
+// isGexPlausible — guard against corrupted /gex responses where the
+// gamma flip level disagrees wildly with the call/put walls (Signa has
+// returned e.g. SPY flip=565 while callWall=753, putWall=750, spot~751).
+//
+// Rule: flip must sit roughly between putWall × 0.9 and callWall × 1.1.
+// If either wall is missing or non-positive, treat as implausible.
+// Returns true only when all three values exist, are finite, and the
+// flip is within the plausibility band.
+export function isGexPlausible(gexData) {
+  const levels = gexData?.levels ?? gexData ?? {};
+  const flip     = Number(levels.gammaFlipLevel ?? levels.flipLevel);
+  const callWall = Number(levels.callWall);
+  const putWall  = Number(levels.putWall);
+  if (!Number.isFinite(flip))     return false;
+  if (!Number.isFinite(callWall) || callWall <= 0) return false;
+  if (!Number.isFinite(putWall)  || putWall  <= 0) return false;
+  const lo = Math.min(putWall, callWall) * 0.9;
+  const hi = Math.max(putWall, callWall) * 1.1;
+  return flip >= lo && flip <= hi;
 }
 
 export function getEnhancedSignal() {

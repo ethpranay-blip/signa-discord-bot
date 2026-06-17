@@ -1480,19 +1480,25 @@ export function buildCallCard(ticker, signalData, gexData, verdictResult, option
     fields.push({ name: 'Levels', value: posLines.join('  ·  '), inline: false });
   }
 
-  // GEX from spyGex
-  const gex = gexData?.levels ?? gexData ?? {};
-  const regimeAbove = gex.regimeAboveFlip;
-  const gexLines = [];
-  if (gex.gammaFlipLevel != null) gexLines.push(`Flip \`$${Number(gex.gammaFlipLevel).toFixed(2)}\``);
-  if (gex.callWall       != null) gexLines.push(`Call Wall \`$${Number(gex.callWall).toFixed(2)}\``);
-  if (gex.putWall        != null) gexLines.push(`Put Wall \`$${Number(gex.putWall).toFixed(2)}\``);
-  if (gexLines.length > 0 || regimeAbove != null) {
-    const regimeLabel = regimeAbove === true  ? '🟢 ABOVE FLIP — bullish gamma'
-                      : regimeAbove === false ? '🔴 BELOW FLIP — bearish gamma'
-                      : null;
-    const gexValue = [...gexLines, regimeLabel].filter(Boolean).join('  ·  ');
-    fields.push({ name: 'GEX (SPY)', value: gexValue, inline: false });
+  // GEX from spyGex. Callers pass null when the upstream read failed
+  // plausibility (e.g. flip wildly off the walls); in that case we must
+  // not publish a flip number, just say "unavailable this cycle".
+  if (gexData == null) {
+    fields.push({ name: 'GEX (SPY)', value: '⚠️ unavailable this cycle (plausibility check failed)', inline: false });
+  } else {
+    const gex = gexData?.levels ?? gexData ?? {};
+    const regimeAbove = gex.regimeAboveFlip;
+    const gexLines = [];
+    if (gex.gammaFlipLevel != null) gexLines.push(`Flip \`$${Number(gex.gammaFlipLevel).toFixed(2)}\``);
+    if (gex.callWall       != null) gexLines.push(`Call Wall \`$${Number(gex.callWall).toFixed(2)}\``);
+    if (gex.putWall        != null) gexLines.push(`Put Wall \`$${Number(gex.putWall).toFixed(2)}\``);
+    if (gexLines.length > 0 || regimeAbove != null) {
+      const regimeLabel = regimeAbove === true  ? '🟢 ABOVE FLIP — bullish gamma'
+                        : regimeAbove === false ? '🔴 BELOW FLIP — bearish gamma'
+                        : null;
+      const gexValue = [...gexLines, regimeLabel].filter(Boolean).join('  ·  ');
+      fields.push({ name: 'GEX (SPY)', value: gexValue, inline: false });
+    }
   }
 
   // Triggers from signa surface — entries are objects ({name, type, ...}); render .name only.
@@ -1516,10 +1522,16 @@ export function buildCallCard(ticker, signalData, gexData, verdictResult, option
     });
   }
 
-  // Gate footer
+  // Gate footer. gates[g] === true is a pass, 'unavailable' marks a gate
+  // we deliberately couldn't evaluate (e.g. gate 5 with implausible GEX),
+  // anything else is a fail.
   const gates = verdictResult.gates || {};
   const gateStr = ['gate1', 'gate2', 'gate3', 'gate4', 'gate5', 'gate6']
-    .map((g, i) => `${gates[g] ? '✅' : '❌'}g${i + 1}`)
+    .map((g, i) => {
+      const v = gates[g];
+      const mark = v === true ? '✅' : v === 'unavailable' ? '⚠️' : '❌';
+      return `${mark}g${i + 1}`;
+    })
     .join(' ');
   fields.push({ name: 'Gates', value: gateStr, inline: false });
 
