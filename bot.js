@@ -666,6 +666,8 @@ process.on('uncaughtException', (err) => {
 // ============================================================
 // CLI flags
 //   node bot.js --dry-run [TICKER]   → fetch signal + SPY GEX, compute verdict, log only
+//   node bot.js --post-test TICKER   → fetch signal + SPY GEX, build call card,
+//                                       POST only to DISCORD_TEST_WEBHOOK_URL, exit
 //   node bot.js --run-hourly-now     → run one hourly scan cycle and exit
 //   node bot.js --digest-now         → run nightly digest and exit
 //   node bot.js --premarket-now      → run pre-market brief and exit
@@ -718,6 +720,48 @@ if (cliArgs.includes('--dry-run')) {
       process.exit(1);
     }
   })();
+} else if (cliArgs.includes('--post-test')) {
+  // Fetch signal + GEX, build call card, POST only to DISCORD_TEST_WEBHOOK_URL, exit.
+  // Never starts the scheduler, the gateway client, or posts a startup card.
+  const postIdx = cliArgs.indexOf('--post-test');
+  const rawTicker = cliArgs[postIdx + 1];
+  if (!rawTicker || rawTicker.startsWith('--')) {
+    console.error('\n❌ --post-test requires a TICKER argument (e.g. `node bot.js --post-test NVDA`).\n');
+    process.exit(1);
+  }
+  const testTicker = rawTicker.toUpperCase();
+  const testWebhook = process.env.DISCORD_TEST_WEBHOOK_URL;
+  if (!SIGNA_API_KEY) {
+    console.error('\n❌ SIGNA_API_KEY is not set. Add it to .env before running --post-test.\n');
+    process.exit(1);
+  }
+  if (!testWebhook) {
+    console.error('\n❌ DISCORD_TEST_WEBHOOK_URL is not set. Add a #test channel webhook to .env first.\n');
+    process.exit(1);
+  }
+  console.log(`\n[${ts()}] Post-test — ${testTicker} → DISCORD_TEST_WEBHOOK_URL\n`);
+  (async () => {
+    try {
+      const [sig, spyGex] = await Promise.all([getSignal(testTicker), getGex('SPY')]);
+      const verdict = computeVerdict(sig, spyGex);
+      console.log(`Verdict: ${verdict.verdict}`);
+      const card = buildCallCard(testTicker, sig, spyGex, verdict);
+      if (!card) {
+        console.error('\n❌ buildCallCard returned empty payload — nothing to post.\n');
+        process.exit(1);
+      }
+      const ok = await postToDiscord(testWebhook, card, `post-test-${testTicker}`);
+      if (!ok) {
+        console.error('\n❌ Post-test failed — see error above.\n');
+        process.exit(1);
+      }
+      console.log(`\n✓ Post-test complete — card posted to test webhook.\n`);
+      process.exit(0);
+    } catch (err) {
+      console.error(`\n❌ Post-test failed: ${err.message}\n`);
+      process.exit(1);
+    }
+  })();
 } else if (cliArgs.includes('--run-hourly-now')) {
   runOneShot('Hourly scan', runHourlyScan);
 } else if (cliArgs.includes('--digest-now')) {
@@ -729,6 +773,15 @@ if (cliArgs.includes('--dry-run')) {
   console.error('   POST /api/v1/backtest is an undocumented endpoint not included in Founding tier.\n');
   process.exit(1);
 } else {
+  // Unknown flag guard: any --flag we did not match above must error out
+  // rather than silently fall through to launching the scheduled bot.
+  const unknownFlag = cliArgs.find(a => a.startsWith('--'));
+  if (unknownFlag) {
+    console.error(`\n❌ Unknown CLI flag: ${unknownFlag}`);
+    console.error('   Known flags: --dry-run [TICKER], --post-test TICKER, --run-hourly-now,');
+    console.error('                --digest-now, --premarket-now, --backtest\n');
+    process.exit(1);
+  }
   // Normal run — start scheduled bot
   startup().catch(err => {
     logErr(`Fatal startup error: ${err.message}`);
