@@ -745,7 +745,7 @@ if (cliArgs.includes('--dry-run')) {
       const [sig, spyGex] = await Promise.all([getSignal(testTicker), getGex('SPY')]);
       const verdict = computeVerdict(sig, spyGex);
       console.log(`Verdict: ${verdict.verdict}`);
-      const card = buildCallCard(testTicker, sig, spyGex, verdict);
+      const card = buildCallCard(testTicker, sig, spyGex, verdict, { isPreview: true });
       if (!card) {
         console.error('\n❌ buildCallCard returned empty payload — nothing to post.\n');
         process.exit(1);

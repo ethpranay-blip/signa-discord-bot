@@ -1438,11 +1438,13 @@ export function buildStartupNotice(accountInfo, nextDigestTime, watchlistCount) 
 }
 
 // ============================================================
-// buildCallCard — ⚡ CALL verdict card for #signals
+// buildCallCard — verdict card for #signals (CALL only in live use)
 // Implements the pinned-card format per brief §3.
+// options.isPreview = true marks NO-CALL previews emitted by --post-test
+// so the test card cannot be mistaken for a live alert.
 // ============================================================
 
-export function buildCallCard(ticker, signalData, gexData, verdictResult) {
+export function buildCallCard(ticker, signalData, gexData, verdictResult, options = {}) {
   if (!ticker || !signalData || !verdictResult) return null;
   const signa  = signalData.signa  || {};
   const data   = signalData.data   || {};
@@ -1452,15 +1454,17 @@ export function buildCallCard(ticker, signalData, gexData, verdictResult) {
   const action    = String(signa.action || '').toUpperCase();
   const gEmoji    = GRADE_EMOJI[grade?.[0]] || '·';
   const dEmoji    = DIR_EMOJI[action] || '·';
-  const color     = DIR_COLOR[action] ?? DIR_COLOR.NEUTRAL;
+  const isCall    = verdictResult.verdict === 'CALL';
+  const color     = isCall ? (DIR_COLOR[action] ?? DIR_COLOR.NEUTRAL) : 0x808080;
 
   const engineFresh = engine.runAt
     ? (Date.now() - new Date(engine.runAt).getTime()) < 86_400_000
     : false;
 
+  const alphaMark = signa.alphaEvent === true ? '✅' : '❌';
   const headerLines = [
     `${gEmoji} **Grade ${grade}**  ·  ${dEmoji} **${action}**  ·  Conviction: \`${signa.conviction || '—'}\``,
-    `alphaEvent: ✅  flowScore: \`${signa.flowScore ?? '—'}\`  risk: \`${signa.riskRating || '—'}\`  regime: \`${signa.regimeClass || '—'}\``
+    `alphaEvent: ${alphaMark}  flowScore: \`${signa.flowScore ?? '—'}\`  risk: \`${signa.riskRating || '—'}\`  regime: \`${signa.regimeClass || '—'}\``
   ];
 
   const fields = [];
@@ -1491,10 +1495,16 @@ export function buildCallCard(ticker, signalData, gexData, verdictResult) {
     fields.push({ name: 'GEX (SPY)', value: gexValue, inline: false });
   }
 
-  // Triggers from signa surface
+  // Triggers from signa surface — entries are objects ({name, type, ...}); render .name only.
   const triggers = Array.isArray(signa.triggers) ? signa.triggers : [];
   if (triggers.length > 0) {
-    fields.push({ name: 'Triggers', value: triggers.slice(0, 8).join(', '), inline: false });
+    const triggerNames = triggers
+      .slice(0, 8)
+      .map(t => (typeof t === 'string' ? t : t?.name))
+      .filter(Boolean);
+    if (triggerNames.length > 0) {
+      fields.push({ name: 'Triggers', value: triggerNames.join(', '), inline: false });
+    }
   }
 
   // engine confirmation (only if fresh)
@@ -1513,8 +1523,11 @@ export function buildCallCard(ticker, signalData, gexData, verdictResult) {
     .join(' ');
   fields.push({ name: 'Gates', value: gateStr, inline: false });
 
+  const titleBadge = isCall
+    ? '⚡ CALL'
+    : options.isPreview ? '🚫 NO-CALL (preview)' : '🚫 NO-CALL';
   const embed = {
-    title: `⚡ CALL — ${ticker}   ${todayStr()}`,
+    title: `${titleBadge} — ${ticker}   ${todayStr()}`,
     description: headerLines.join('\n'),
     color,
     fields,
