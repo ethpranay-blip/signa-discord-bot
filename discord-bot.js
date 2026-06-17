@@ -13,7 +13,7 @@ import {
   MessageFlags
 } from 'discord.js';
 
-import { getSignal, getQuote } from './signa-client.js';
+import { getSignal, getQuote, getMe } from './signa-client.js';
 import { buildSignaSlashResponse } from './formatter.js';
 
 const APP_ID   = process.env.DISCORD_APPLICATION_ID;
@@ -32,6 +32,11 @@ const SIGNA_COMMAND = new SlashCommandBuilder()
       .setMinLength(1)
       .setMaxLength(10)
   )
+  .toJSON();
+
+const HEALTH_COMMAND = new SlashCommandBuilder()
+  .setName('health')
+  .setDescription('Check Signa API key validity and remaining call quota')
   .toJSON();
 
 function ts() {
@@ -60,9 +65,9 @@ async function registerGuildCommands() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
   await rest.put(
     Routes.applicationGuildCommands(APP_ID, GUILD_ID),
-    { body: [SIGNA_COMMAND] }
+    { body: [SIGNA_COMMAND, HEALTH_COMMAND] }
   );
-  log(`✓ Registered 1 slash command (/signa) for guild ${GUILD_ID}`);
+  log(`✓ Registered 2 slash commands (/signa, /health) for guild ${GUILD_ID}`);
 }
 
 // Discord locks reply visibility at deferReply time. To keep success public
@@ -117,6 +122,39 @@ async function handleSignaCommand(interaction) {
   }
 }
 
+async function handleHealthCommand(interaction) {
+  try {
+    const me = await withTimeout(getMe(), SIGNA_API_TIMEOUT_MS, 'Signa /me');
+    const remaining = me?.api?.calls_remaining ?? me?.calls_remaining ?? me?.quota?.remaining ?? null;
+    const scopes    = me?.api?.scopes ?? me?.scopes ?? [];
+    const plan      = me?.api?.plan   ?? me?.plan   ?? me?.tier ?? 'unknown';
+    const user      = me?.email       ?? me?.username ?? me?.user?.email ?? null;
+
+    const lines = [
+      `**Status:** ✅ Key valid`,
+      `**Plan:** ${plan}`,
+      remaining !== null ? `**Quota remaining:** ${remaining} calls this hour` : `**Quota:** unavailable`,
+      scopes.length ? `**Scopes:** ${scopes.join(', ')}` : null,
+      user ? `**Account:** ${user}` : null,
+    ].filter(Boolean).join('\n');
+
+    return interaction.editReply({
+      embeds: [{
+        title: '🩺 Signa API Health',
+        description: lines,
+        color: remaining !== null && remaining < 20 ? 0xFF9900 : 0x00CC66,
+        timestamp: new Date().toISOString()
+      }]
+    });
+  } catch (err) {
+    const msg = err?.message || String(err);
+    if (/401/i.test(msg)) return sendEphemeralError(interaction, '❌ API key invalid (401). Check `SIGNA_API_KEY`.');
+    if (/timed out/i.test(msg)) return sendEphemeralError(interaction, 'Signa API timeout — try again.');
+    logErr(`/health failed: ${msg}`);
+    return sendEphemeralError(interaction, `Health check failed: ${msg.slice(0, 200)}`);
+  }
+}
+
 export async function startDiscordBot() {
   if (!APP_ID || !TOKEN || !GUILD_ID) {
     logErr('Discord bot disabled: DISCORD_APPLICATION_ID / DISCORD_BOT_TOKEN / DISCORD_GUILD_ID not all set');
@@ -136,7 +174,7 @@ export async function startDiscordBot() {
 
   client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
-    if (interaction.commandName !== 'signa') return;
+    if (interaction.commandName !== 'signa' && interaction.commandName !== 'health') return;
 
     try {
       await interaction.deferReply();
@@ -144,7 +182,9 @@ export async function startDiscordBot() {
       logErr(`deferReply failed: ${err.message}`);
       return;
     }
-    await handleSignaCommand(interaction);
+
+    if (interaction.commandName === 'signa')  await handleSignaCommand(interaction);
+    if (interaction.commandName === 'health') await handleHealthCommand(interaction);
   });
 
   client.on('error',      (err) => logErr(`Discord client error: ${err.message}`));
