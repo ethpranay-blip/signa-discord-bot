@@ -2,7 +2,7 @@
 // signa-client.js
 // Thin wrapper around the Signa API (app.getsigna.ai).
 // - Retry: 3 attempts, exponential backoff (1s/2s/4s) on 429 + 5xx
-// - Rate-limit guard: sliding window, 100 req/min (well below 2000/min cap)
+// - Rate-limit guard: sliding window, 58 req/hr (Founding plan: 60/hr · 1000/day)
 // - Auth: Authorization: Bearer ${SIGNA_API_KEY}
 // - Run directly (`node signa-client.js`) to test every endpoint.
 // ============================================================
@@ -13,9 +13,9 @@ import 'dotenv/config';
 const BASE_URL = 'https://app.getsigna.ai';
 const API_KEY = process.env.SIGNA_API_KEY;
 
-// --- Sliding-window rate limit guard ---
-const RATE_LIMIT_WINDOW_MS = 60_000;
-const RATE_LIMIT_MAX = 100; // safety margin under the 2000/min Founding cap
+// --- Sliding-window rate limit guard (hourly budget) ---
+const RATE_LIMIT_WINDOW_MS = 3_600_000; // 1 hour
+const RATE_LIMIT_MAX = 58; // stay 2 under the 60/hr Founding plan limit
 const _requestTimestamps = [];
 
 async function rateLimitGuard() {
@@ -82,11 +82,24 @@ async function signaFetch(path, options = {}) {
     }
 
     if (res.ok) {
+      let body;
       try {
-        return await res.json();
+        body = await res.json();
       } catch (parseErr) {
         throw new Error(`Signa returned non-JSON for ${path}: ${parseErr.message}`);
       }
+      // Attach the upstream request id as a non-enumerable property so existing
+      // callers see no behavior change but callers that need it (e.g. getGex
+      // logging an implausible flip) can read body.__requestId.
+      const reqId = res.headers.get('x-request-id')
+                 || res.headers.get('x-amzn-trace-id')
+                 || res.headers.get('request-id')
+                 || null;
+      if (reqId && body && typeof body === 'object') {
+        try { Object.defineProperty(body, '__requestId', { value: reqId, enumerable: false }); }
+        catch { /* frozen/sealed — ignore */ }
+      }
+      return body;
     }
 
     // Auth-style errors — never retry, give a precise message
@@ -198,9 +211,34 @@ export async function getSignal(ticker) {
   return signaFetch(`/api/v1/signal?sym=${encodeURIComponent(ticker)}`);
 }
 
-export async function getEnhancedSignal(ticker) {
-  if (!ticker) throw new Error('getEnhancedSignal: ticker is required');
-  return signaFetch(`/api/v1/enhanced-signal?sym=${encodeURIComponent(ticker)}`);
+export async function getGex(symbol) {
+  if (!symbol) throw new Error('getGex: symbol is required');
+  return signaFetch(`/api/v1/gex/${encodeURIComponent(String(symbol).toUpperCase())}`);
+}
+
+// isGexPlausible — guard against corrupted /gex responses where the
+// gamma flip level disagrees wildly with the call/put walls (Signa has
+// returned e.g. SPY flip=565 while callWall=753, putWall=750, spot~751).
+//
+// Rule: flip must sit roughly between putWall × 0.9 and callWall × 1.1.
+// If either wall is missing or non-positive, treat as implausible.
+// Returns true only when all three values exist, are finite, and the
+// flip is within the plausibility band.
+export function isGexPlausible(gexData) {
+  const levels = gexData?.levels ?? gexData ?? {};
+  const flip     = Number(levels.gammaFlipLevel ?? levels.flipLevel);
+  const callWall = Number(levels.callWall);
+  const putWall  = Number(levels.putWall);
+  if (!Number.isFinite(flip))     return false;
+  if (!Number.isFinite(callWall) || callWall <= 0) return false;
+  if (!Number.isFinite(putWall)  || putWall  <= 0) return false;
+  const lo = Math.min(putWall, callWall) * 0.9;
+  const hi = Math.max(putWall, callWall) * 1.1;
+  return flip >= lo && flip <= hi;
+}
+
+export function getEnhancedSignal() {
+  throw new Error('getEnhancedSignal: /api/v1/enhanced-signal is not available on the Founding plan — use getSignal() instead.');
 }
 
 export async function getAnalysis(ticker) {
@@ -240,12 +278,12 @@ export async function scan(params = {}) {
 // Internal endpoints (same Bearer; same origin in browser)
 // ============================================================
 
-export async function getScoredSignals(limit = 200) {
-  return signaFetch(`/api/signals/run?scored=true&limit=${limit}`);
+export function getScoredSignals() {
+  throw new Error('getScoredSignals: /api/signals/run is not available on the Founding plan — use getSignal() per ticker instead.');
 }
 
-export async function getSignalFeed(limit = 200) {
-  return signaFetch(`/api/signals/feed?limit=${limit}`);
+export function getSignalFeed() {
+  throw new Error('getSignalFeed: /api/signals/feed is not available on the Founding plan — use getSignal() per ticker instead.');
 }
 
 // screenTickers — runs your watchlist through the Signa pipeline and returns
@@ -349,8 +387,8 @@ export async function screenTickers(tickers = []) {
   };
 }
 
-export async function getDarkPool(ticker = 'SPY', limit = 100) {
-  return signaFetch(`/api/darkpool/prints?ticker=${encodeURIComponent(ticker)}&limit=${limit}`);
+export function getDarkPool() {
+  throw new Error('getDarkPool: /api/darkpool/prints is not available on the Founding plan — flow data is in signa.flowScore from getSignal().');
 }
 
 // runAgent — NOT USED by any scheduled job in bot.js. Kept exported for future
@@ -366,8 +404,8 @@ export async function runAgent(agentId, ticker = null) {
   );
 }
 
-export async function getCalendar(weeks = 2) {
-  return signaFetch(`/api/calendar?weeks=${weeks}`);
+export function getCalendar() {
+  throw new Error('getCalendar: /api/calendar is not available on the Founding plan.');
 }
 
 // ============================================================
@@ -398,81 +436,8 @@ export async function getCalendar(weeks = 2) {
 //   - holdingPeriod  e.g. 30   = max 30-day hold
 // ============================================================
 
-const MAX_BACKTEST_DAYS = 4 * 365 + 11 * 30; // ~4 years 11 months
-
-export async function runBacktest({
-  symbol,
-  startDate,
-  endDate,
-  initialCapital = 100000,
-  positionSize = 0.1,
-  stopLoss = 0.05,
-  takeProfit = 0.10,
-  holdingPeriod = 30
-} = {}) {
-  if (!symbol) throw new Error('runBacktest: symbol is required');
-  if (!startDate || !endDate) throw new Error('runBacktest: startDate and endDate are required (ISO YYYY-MM-DD)');
-
-  // Defensive clamp on window length so we never trip the 5y cap.
-  const start = new Date(startDate);
-  const end = new Date(endDate);
-  if (isNaN(start) || isNaN(end)) {
-    throw new Error('runBacktest: startDate/endDate must be valid YYYY-MM-DD');
-  }
-  const days = Math.round((end - start) / (1000 * 60 * 60 * 24));
-  if (days > MAX_BACKTEST_DAYS) {
-    const newStart = new Date(end.getTime() - MAX_BACKTEST_DAYS * 24 * 60 * 60 * 1000);
-    startDate = newStart.toISOString().slice(0, 10);
-  }
-  if (days < 30) {
-    throw new Error('runBacktest: window too short (need at least 30 days)');
-  }
-
-  // Validate position size + capital (Signa enforces these)
-  if (positionSize <= 0 || positionSize > 1) {
-    throw new Error('runBacktest: positionSize must be between 0 and 1');
-  }
-  if (initialCapital <= 0) {
-    throw new Error('runBacktest: initialCapital must be a positive number');
-  }
-
-  const body = {
-    symbol: String(symbol).toUpperCase(),
-    startDate,
-    endDate,
-    initialCapital,
-    positionSize,
-    stopLoss,
-    takeProfit,
-    holdingPeriod
-  };
-
-  const raw = await signaFetch('/api/v1/backtest', {
-    method: 'POST',
-    body: JSON.stringify(body)
-  });
-
-  // Normalize response — Signa returns { ok, backtest: { config, summary, equity, trades, ... } }
-  const bt = raw?.backtest || raw;
-  if (!bt?.summary) {
-    throw new Error('runBacktest: unexpected response shape — no summary field');
-  }
-
-  // Merge request params with response config — Signa drops some fields
-  // (notably holdingPeriod) from the response, so we use what we sent
-  // as the source of truth for display.
-  const mergedConfig = { ...body, ...(bt.config || {}) };
-  if (body.holdingPeriod != null) mergedConfig.holdingPeriod = body.holdingPeriod;
-
-  return {
-    config: mergedConfig,
-    summary: bt.summary,
-    equity: Array.isArray(bt.equity) ? bt.equity : [],
-    trades: Array.isArray(bt.trades) ? bt.trades : [],
-    monthlyReturns: Array.isArray(bt.monthlyReturns) ? bt.monthlyReturns : [],
-    monteCarlo: bt.monteCarlo || null,
-    raw
-  };
+export function runBacktest() {
+  throw new Error('runBacktest: POST /api/v1/backtest is not available on the Founding plan.');
 }
 
 // ============================================================
@@ -501,22 +466,23 @@ export async function runTests() {
 
   console.log(`\n=== Signa API Test Suite — ${ts()} ===\n`);
 
+  // Documented Founding-plan endpoints
   await check('getMe',                 () => getMe());
   await check('getSignalIndex',        () => getSignalIndex());
   await check('getSignal(NVDA)',       () => getSignal(TEST_TICKER));
-  await check('getEnhancedSignal',     () => getEnhancedSignal(TEST_TICKER));
+  await check('getGex(SPY)',           () => getGex('SPY'));
   await check('getAnalysis(NVDA)',     () => getAnalysis(TEST_TICKER));
   await check('getQuote(NVDA)',        () => getQuote(TEST_TICKER));
   await check('getHistory(NVDA)',      () => getHistory(TEST_TICKER));
   await check('scan(symbols=…)',       () => scan({ symbols: ['NVDA', 'AAPL', 'SPY'] }));
-  await check('getScoredSignals',      () => getScoredSignals(10));
-  await check('getSignalFeed',         () => getSignalFeed(10));
   await check('screenTickers([NVDA])', () => screenTickers(['NVDA', 'AAPL']));
-  await check('getDarkPool(SPY)',      () => getDarkPool('SPY', 5));
-  await check('getCalendar(1w)',       () => getCalendar(1));
+
+  // Unavailable on Founding plan — stubs throw a clear error
+  for (const name of ['getScoredSignals', 'getSignalFeed', 'getDarkPool', 'getCalendar', 'runBacktest', 'getEnhancedSignal']) {
+    console.log(`[${ts()}] Skipped ${name.padEnd(20)} ... ⏭️   (not available on Founding plan)`);
+  }
 
   // /api/agents/run is session-authed only — not callable from a server bot.
-  // Skipped in the test suite by design. See runAgent() for details.
   console.log(`[${ts()}] Skipped runAgent             ... ⏭️   (session-only endpoint)`);
 
   const passed = results.filter(r => r.ok).length;

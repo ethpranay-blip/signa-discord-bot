@@ -744,9 +744,39 @@ export function buildPremarketBrief(earnings, watchlistSignals) {
 // ============================================================
 
 // Internal: extract drivers from a /api/v1/signal Action Card response.
-// Signa's response shape varies — we normalize across common field names.
+// Handles both the 4-surface response { signa, data, engine } and the older flat shape.
 function extractActionCardData(actionCard) {
   if (!actionCard) return null;
+
+  // 4-surface response from /api/v1/signal: { signa, data, engine }
+  if (actionCard.signa) {
+    const signa = actionCard.signa;
+    const d = actionCard.data || {};
+    const grade = String(signa.grade ?? d.grade ?? '?').toUpperCase();
+    const direction = String(signa.action || d.direction || '').toUpperCase();
+    const triggers = Array.isArray(signa.triggers) ? signa.triggers : [];
+    const flowScore = Number(signa.flowScore ?? 0);
+    return {
+      grade,
+      score: flowScore > 0 ? Math.round(flowScore) : null,
+      direction: direction || (grade.startsWith('A') ? 'LONG' : 'NEUTRAL'),
+      tier: null,
+      bullishDrivers: [],
+      bearishDrivers: [],
+      reasons: triggers,
+      entry:  d.entry  ?? null,
+      stop:   d.stop   ?? null,
+      target: d.target ?? null,
+      sizeMultiplier: null,
+      suggestedSize:  null,
+      regime:     signa.regimeClass ?? null,
+      confidence: signa.conviction  ?? null,
+      totalDrivers: triggers.length,
+      bullishCount: direction === 'LONG'  ? triggers.length : 0,
+      bearishCount: direction === 'SHORT' ? triggers.length : 0
+    };
+  }
+
   const d = actionCard.data ?? actionCard.action_card ?? actionCard.signal ?? actionCard;
 
   const grade = String(d.grade ?? d.letter_grade ?? d.actionCardGrade ?? '?').toUpperCase();
@@ -1404,5 +1434,395 @@ export function buildStartupNotice(accountInfo, nextDigestTime, watchlistCount) 
     footer: FOOTER,
     timestamp: new Date().toISOString()
   };
+  return { embeds: fitMessage([embed]) };
+}
+
+// ============================================================
+// buildCallCard — verdict card for #signals (CALL only in live use)
+// Implements the pinned-card format per brief §3.
+// options.isPreview = true marks NO-CALL previews emitted by --post-test
+// so the test card cannot be mistaken for a live alert.
+// ============================================================
+
+export function buildCallCard(ticker, signalData, gexData, verdictResult, options = {}) {
+  if (!ticker || !signalData || !verdictResult) return null;
+  const signa  = signalData.signa  || {};
+  const data   = signalData.data   || {};
+  const engine = signalData.engine || {};
+
+  const grade     = String(signa.grade || '?').toUpperCase();
+  const action    = String(signa.action || '').toUpperCase();
+  const gEmoji    = GRADE_EMOJI[grade?.[0]] || '·';
+  const dEmoji    = DIR_EMOJI[action] || '·';
+  const isCall    = verdictResult.verdict === 'CALL';
+  const color     = isCall ? (DIR_COLOR[action] ?? DIR_COLOR.NEUTRAL) : 0x808080;
+
+  const engineFresh = engine.runAt
+    ? (Date.now() - new Date(engine.runAt).getTime()) < 86_400_000
+    : false;
+
+  const alphaMark = signa.alphaEvent === true ? '✅' : '❌';
+  const headerLines = [
+    `${gEmoji} **Grade ${grade}**  ·  ${dEmoji} **${action}**  ·  Conviction: \`${signa.conviction || '—'}\``,
+    `alphaEvent: ${alphaMark}  flowScore: \`${signa.flowScore ?? '—'}\`  risk: \`${signa.riskRating || '—'}\`  regime: \`${signa.regimeClass || '—'}\``
+  ];
+
+  const fields = [];
+
+  // Levels from data surface
+  const posLines = [];
+  if (data.entry  != null) posLines.push(`Entry \`${fmtPrice(data.entry)}\``);
+  if (data.stop   != null) posLines.push(`Stop \`${fmtPrice(data.stop)}\``);
+  if (data.target != null) posLines.push(`Target \`${fmtPrice(data.target)}\``);
+  if (data.rr     != null) posLines.push(`R/R \`${Number(data.rr).toFixed(2)}\``);
+  if (data.price  != null) posLines.push(`Price \`${fmtPrice(data.price)}\``);
+  if (posLines.length > 0) {
+    fields.push({ name: 'Levels', value: posLines.join('  ·  '), inline: false });
+  }
+
+  // GEX from spyGex. Callers pass null when the upstream read failed
+  // plausibility (e.g. flip wildly off the walls); in that case we must
+  // not publish a flip number, just say "unavailable this cycle".
+  if (gexData == null) {
+    fields.push({ name: 'GEX (SPY)', value: '⚠️ unavailable this cycle (plausibility check failed)', inline: false });
+  } else {
+    const gex = gexData?.levels ?? gexData ?? {};
+    const regimeAbove = gex.regimeAboveFlip;
+    const gexLines = [];
+    if (gex.gammaFlipLevel != null) gexLines.push(`Flip \`$${Number(gex.gammaFlipLevel).toFixed(2)}\``);
+    if (gex.callWall       != null) gexLines.push(`Call Wall \`$${Number(gex.callWall).toFixed(2)}\``);
+    if (gex.putWall        != null) gexLines.push(`Put Wall \`$${Number(gex.putWall).toFixed(2)}\``);
+    if (gexLines.length > 0 || regimeAbove != null) {
+      const regimeLabel = regimeAbove === true  ? '🟢 ABOVE FLIP — bullish gamma'
+                        : regimeAbove === false ? '🔴 BELOW FLIP — bearish gamma'
+                        : null;
+      const gexValue = [...gexLines, regimeLabel].filter(Boolean).join('  ·  ');
+      fields.push({ name: 'GEX (SPY)', value: gexValue, inline: false });
+    }
+  }
+
+  // Triggers from signa surface — entries are objects ({name, type, ...}); render .name only.
+  const triggers = Array.isArray(signa.triggers) ? signa.triggers : [];
+  if (triggers.length > 0) {
+    const triggerNames = triggers
+      .slice(0, 8)
+      .map(t => (typeof t === 'string' ? t : t?.name))
+      .filter(Boolean);
+    if (triggerNames.length > 0) {
+      fields.push({ name: 'Triggers', value: triggerNames.join(', '), inline: false });
+    }
+  }
+
+  // engine confirmation (only if fresh)
+  if (engineFresh && engine.modelCount != null) {
+    fields.push({
+      name: 'Engine (fresh)',
+      value: `modelCount: \`${engine.modelCount}\`  runAt: \`${String(engine.runAt || '').slice(0, 16)}\``,
+      inline: false
+    });
+  }
+
+  // Gate footer. gates[g] === true is a pass, 'unavailable' marks a gate
+  // we deliberately couldn't evaluate (e.g. gate 5 with implausible GEX),
+  // anything else is a fail.
+  const gates = verdictResult.gates || {};
+  const gateStr = ['gate1', 'gate2', 'gate3', 'gate4', 'gate5', 'gate6']
+    .map((g, i) => {
+      const v = gates[g];
+      const mark = v === true ? '✅' : v === 'unavailable' ? '⚠️' : '❌';
+      return `${mark}g${i + 1}`;
+    })
+    .join(' ');
+  fields.push({ name: 'Gates', value: gateStr, inline: false });
+
+  const titleBadge = isCall
+    ? '⚡ CALL'
+    : options.isPreview ? '🚫 NO-CALL (preview)' : '🚫 NO-CALL';
+  const embed = {
+    title: `${titleBadge} — ${ticker}   ${todayStr()}`,
+    description: headerLines.join('\n'),
+    color,
+    fields,
+    footer: FOOTER,
+    timestamp: new Date().toISOString()
+  };
+
+  return { embeds: fitMessage([embed]) };
+}
+
+// ============================================================
+// buildWatchlistGrid — hourly all-tickers evaluation for #micro
+// ============================================================
+
+export function buildWatchlistGrid(results) {
+  if (!results || results.length === 0) return null;
+
+  const calls   = results.filter(r => r.verdict?.verdict === 'CALL');
+  const noCalls = results.filter(r => r.verdict?.verdict !== 'CALL');
+
+  // First gate that failed for each NO-CALL
+  function firstFailGate(gates) {
+    if (!gates) return '?';
+    for (let i = 1; i <= 6; i++) {
+      if (!gates[`gate${i}`]) return `g${i}`;
+    }
+    return '—';
+  }
+
+  const fmtRow = (r) => {
+    const signa  = r.signal?.signa  || {};
+    const action = String(signa.action || '').toUpperCase();
+    const grade  = String(signa.grade  || '?').toUpperCase();
+    const flow   = signa.flowScore != null ? Math.round(Number(signa.flowScore)) : '—';
+    const dEmoji = DIR_EMOJI[action] || '·';
+    const gEmoji = GRADE_EMOJI[grade?.[0]] || '·';
+    return `${dEmoji}${gEmoji} \`${r.ticker.padEnd(5)}\` ${grade} ${action.slice(0, 5).padEnd(5)} flow:\`${String(flow).padEnd(3)}\``;
+  };
+
+  const fields = [];
+
+  if (calls.length > 0) {
+    let value = '';
+    for (const r of calls) {
+      const line = fmtRow(r) + '  ⚡CALL\n';
+      if ((value + line).length > 1000) break;
+      value += line;
+    }
+    fields.push({ name: `⚡ CALLs (${calls.length})`, value: value.trimEnd(), inline: false });
+  }
+
+  // Top NO-CALLs that are grade A/A+ (worth seeing why they didn't pass)
+  const gradeANoCalls = noCalls.filter(r => ['A+', 'A'].includes(String(r.signal?.signa?.grade || '').toUpperCase()));
+  if (gradeANoCalls.length > 0) {
+    let value = '';
+    for (const r of gradeANoCalls.slice(0, 10)) {
+      const fail = firstFailGate(r.verdict?.gates);
+      const line = fmtRow(r) + `  ✗${fail}\n`;
+      if ((value + line).length > 1000) break;
+      value += line;
+    }
+    fields.push({ name: `Grade A/A+ · NO-CALL (${gradeANoCalls.length})`, value: value.trimEnd(), inline: false });
+  }
+
+  const totalNoCalls = noCalls.length;
+  const embed = {
+    title: `📋 Hourly Watchlist Grid — ${nowET()}`,
+    color: 0x00CCFF,
+    description: `${results.length} tickers evaluated  ·  ${calls.length} CALLs  ·  ${totalNoCalls} NO-CALLs`,
+    fields,
+    footer: FOOTER,
+    timestamp: new Date().toISOString()
+  };
+
+  return { embeds: fitMessage([embed]) };
+}
+
+// ============================================================
+// buildRegimeUpdate — GEX regime flip post for #macro
+// ============================================================
+
+export function buildRegimeUpdate(spyGex, qqqGex) {
+  const spyLevels = spyGex?.levels ?? spyGex ?? null;
+  if (!spyLevels) return null;
+
+  const regimeAbove = spyLevels.regimeAboveFlip;
+  const regimeLabel = regimeAbove === true  ? '🟢 ABOVE FLIP — bullish gamma environment'
+                    : regimeAbove === false ? '🔴 BELOW FLIP — bearish gamma environment'
+                    : '⚪ Regime unknown';
+  const color = regimeAbove === true  ? REGIME_COLOR.RISK_ON
+              : regimeAbove === false ? REGIME_COLOR.RISK_OFF
+              : REGIME_COLOR.TRANSITIONAL;
+
+  const fmtLevel = (n) => n != null ? `$${Number(n).toFixed(2)}` : '—';
+
+  const spyLine = [
+    spyLevels.gammaFlipLevel != null ? `Flip \`${fmtLevel(spyLevels.gammaFlipLevel)}\`` : null,
+    spyLevels.callWall       != null ? `Call Wall \`${fmtLevel(spyLevels.callWall)}\`` : null,
+    spyLevels.putWall        != null ? `Put Wall \`${fmtLevel(spyLevels.putWall)}\``   : null
+  ].filter(Boolean).join('  ·  ');
+
+  const descLines = [
+    `**SPY GEX:** ${spyLine || '—'}`,
+    `→ ${regimeLabel}`
+  ];
+
+  const qqqLevels = qqqGex?.levels ?? qqqGex ?? null;
+  if (qqqLevels) {
+    const qqqAbove = qqqLevels.regimeAboveFlip;
+    const qqqLine = [
+      qqqLevels.gammaFlipLevel != null ? `Flip \`${fmtLevel(qqqLevels.gammaFlipLevel)}\`` : null,
+      qqqLevels.callWall       != null ? `Call Wall \`${fmtLevel(qqqLevels.callWall)}\`` : null,
+      qqqLevels.putWall        != null ? `Put Wall \`${fmtLevel(qqqLevels.putWall)}\``   : null
+    ].filter(Boolean).join('  ·  ');
+    const qqqLabel = qqqAbove === true ? '🟢 above flip' : qqqAbove === false ? '🔴 below flip' : '—';
+    descLines.push(`**QQQ GEX:** ${qqqLine || '—'}  →  ${qqqLabel}`);
+  }
+
+  const embed = {
+    title: `🔄 GEX Regime Update — ${todayStr()}`,
+    description: descLines.join('\n'),
+    color,
+    footer: FOOTER,
+    timestamp: new Date().toISOString()
+  };
+
+  return { embeds: fitMessage([embed]) };
+}
+
+// ============================================================
+// buildFlowHighlight — high flow score alert for #darkpool
+// ============================================================
+
+export function buildFlowHighlight(ticker, signalData) {
+  if (!ticker || !signalData) return null;
+  const signa = signalData.signa || {};
+  const flowScore = Number(signa.flowScore ?? 0);
+  if (flowScore === 0) return null;
+
+  const action = String(signa.action || '').toUpperCase();
+  const grade  = String(signa.grade  || '?').toUpperCase();
+  const dEmoji = DIR_EMOJI[action] || '·';
+  const gEmoji = GRADE_EMOJI[grade?.[0]] || '·';
+  const color  = DIR_COLOR[action] ?? DIR_COLOR.NEUTRAL;
+
+  const triggers = Array.isArray(signa.triggers) ? signa.triggers : [];
+  const descLines = [
+    `${gEmoji} **Grade ${grade}**  ·  ${dEmoji} **${action}**  ·  flowScore: \`${Math.round(flowScore)}\``,
+    triggers.length > 0 ? `Triggers: ${triggers.slice(0, 5).join(', ')}` : null
+  ].filter(Boolean);
+
+  const embed = {
+    title: `💧 Flow Alert — ${ticker}`,
+    description: descLines.join('\n'),
+    color,
+    footer: FOOTER,
+    timestamp: new Date().toISOString()
+  };
+
+  return { embeds: fitMessage([embed]) };
+}
+
+// ============================================================
+// buildNightlySummary — daily CALL summary for #signals
+// ============================================================
+
+export function buildNightlySummary(signalIndex, cycleResults, lastCycleTime) {
+  const calls = (cycleResults || []).filter(r => r.verdict?.verdict === 'CALL');
+  const regime = signalIndex?.regime || 'UNKNOWN';
+  const idxScore = signalIndex?.score ?? '—';
+  const color = REGIME_COLOR[regime] ?? REGIME_COLOR.TRANSITIONAL;
+
+  const lastScanLabel = lastCycleTime
+    ? new Date(lastCycleTime).toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour12: false }) + ' ET'
+    : 'not yet run today';
+
+  const description = [
+    `**Signal Index:** \`${idxScore}/100\`  ·  **Regime:** ${regime}`,
+    `**CALLs today:** ${calls.length}  ·  **Last scan:** ${lastScanLabel}`
+  ].join('\n');
+
+  const fields = [];
+
+  if (calls.length > 0) {
+    let value = '';
+    for (const r of calls) {
+      const signa  = r.signal?.signa  || {};
+      const data   = r.signal?.data   || {};
+      const grade  = String(signa.grade  || '?').toUpperCase();
+      const action = String(signa.action || '').toUpperCase();
+      const dEmoji = DIR_EMOJI[action] || '·';
+      const gEmoji = GRADE_EMOJI[grade?.[0]] || '·';
+      const levStr = [
+        data.entry  != null ? `e:${fmtPrice(data.entry)}`  : null,
+        data.stop   != null ? `s:${fmtPrice(data.stop)}`   : null,
+        data.target != null ? `t:${fmtPrice(data.target)}` : null
+      ].filter(Boolean).join(' ');
+      const line = `${dEmoji}${gEmoji} **${r.ticker}** ${grade} · ${action} · flow:\`${Math.round(Number(signa.flowScore ?? 0))}\`${levStr ? ` · ${levStr}` : ''}\n`;
+      if ((value + line).length > 1000) break;
+      value += line;
+    }
+    fields.push({ name: `⚡ Today's CALLs`, value: value.trimEnd(), inline: false });
+  } else {
+    fields.push({ name: 'CALLs', value: '_No CALL verdicts today._', inline: false });
+  }
+
+  // Top signals from signal-index if available
+  const indexTop = (signalIndex?.top_signals || []).slice(0, 5);
+  if (indexTop.length > 0) {
+    fields.push({
+      name: '⭐ Top Index Signals',
+      value: indexTop.map(s => {
+        const dir = String(s.direction || '').toUpperCase();
+        const dEmoji = /BULL|LONG/.test(dir) ? '📈' : /BEAR|SHORT/.test(dir) ? '📉' : '➡️';
+        return `${dEmoji} **${s.symbol}** \`${s.score}\` · ${String(s.grade || '').toUpperCase()} · ${dir}`;
+      }).join('\n'),
+      inline: false
+    });
+  }
+
+  const embed = {
+    title: `📊 Signa Daily Summary — ${todayStr()}`,
+    description,
+    color,
+    fields,
+    footer: FOOTER,
+    timestamp: new Date().toISOString()
+  };
+
+  return { embeds: fitMessage([embed]) };
+}
+
+// ============================================================
+// buildRegimeOutlook — nightly regime post for #macro
+// ============================================================
+
+export function buildRegimeOutlook(signalIndex, spyGex) {
+  if (!signalIndex && !spyGex) return null;
+
+  const regime    = signalIndex?.regime    || 'UNKNOWN';
+  const idxScore  = signalIndex?.score     ?? '—';
+  const sentiment = signalIndex?.sentiment ?? null;
+  const color     = REGIME_COLOR[regime]   ?? REGIME_COLOR.TRANSITIONAL;
+
+  const regimeBadge = regime === 'RISK_ON' ? '🟢 RISK_ON'
+                    : regime === 'RISK_OFF' ? '🔴 RISK_OFF'
+                    : '🟡 TRANSITIONAL';
+
+  const descLines = [
+    `**Regime:** ${regimeBadge}  ·  **Signal Index:** \`${idxScore}/100\`${sentiment ? `  ·  _(${sentiment})_` : ''}`
+  ];
+
+  // GEX summary
+  const spyLevels = spyGex?.levels ?? spyGex ?? null;
+  if (spyLevels) {
+    const regimeAbove = spyLevels.regimeAboveFlip;
+    const fmtLevel = (n) => n != null ? `$${Number(n).toFixed(2)}` : '—';
+    const spyLine = [
+      spyLevels.gammaFlipLevel != null ? `flip ${fmtLevel(spyLevels.gammaFlipLevel)}` : null,
+      spyLevels.callWall       != null ? `cWall ${fmtLevel(spyLevels.callWall)}`       : null,
+      spyLevels.putWall        != null ? `pWall ${fmtLevel(spyLevels.putWall)}`        : null
+    ].filter(Boolean).join('  ');
+    const regimeLine = regimeAbove === true  ? '🟢 price above gamma flip'
+                     : regimeAbove === false ? '🔴 price below gamma flip'
+                     : '';
+    descLines.push(`**SPY GEX:** ${spyLine}  ${regimeLine}`);
+  }
+
+  // Bull/bear breakdown from index
+  const bullCount = signalIndex?.bullish_count ?? null;
+  const bearCount = signalIndex?.bearish_count ?? null;
+  const total     = signalIndex?.total_signals  ?? null;
+  if (total != null) {
+    descLines.push(`**Signals:** ${total} total  ·  📈 ${bullCount ?? '—'} bull  ·  📉 ${bearCount ?? '—'} bear`);
+  }
+
+  const embed = {
+    title: `🌙 Regime Outlook — ${todayStr()}`,
+    description: descLines.join('\n'),
+    color,
+    footer: FOOTER,
+    timestamp: new Date().toISOString()
+  };
+
   return { embeds: fitMessage([embed]) };
 }

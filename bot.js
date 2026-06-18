@@ -2,6 +2,13 @@
 // bot.js
 // Main entry: schedules cron jobs, posts to Discord webhooks,
 // and handles startup validation. Run with `node bot.js`.
+//
+// Signal source: Signa REST API (app.getsigna.ai)
+//   Primary: GET /api/v1/signal per ticker (hourly poll)
+//   Regime:  GET /api/v1/gex/SPY + /api/v1/gex/QQQ
+//   Index:   GET /api/v1/signal-index
+//   Screener: GET /api/v1/scan
+//   Rate limit: 60 req/hr · 1,000/day (Founding plan)
 // ============================================================
 
 import 'dotenv/config';
@@ -11,31 +18,26 @@ import fetch from 'node-fetch';
 import {
   getMe,
   getSignalIndex,
-  getScoredSignals,
-  getSignalFeed,
-  getDarkPool,
-  getCalendar,
-  screenTickers,
-  getEnhancedSignal,
-  getQuote,
   getSignal,
-  runBacktest
+  getGex,
+  isGexPlausible,
+  getQuote,
+  scan,
+  screenTickers
 } from './signa-client.js';
 
 import {
-  buildDailyDigest,
-  buildTier3Alert,
   buildWatchlistSummary,
   buildTickerAlert,
-  buildDarkPoolAlert,
   buildRegimeChange,
-  buildPremarketBrief,
   buildStartupNotice,
-  buildEarningsActionCard60,
-  buildEarningsActionCard15,
-  buildEarningsFollowUp,
-  buildBacktestResult,
-  buildConsensusAlert
+  buildSignaSlashResponse,
+  buildCallCard,
+  buildWatchlistGrid,
+  buildRegimeUpdate,
+  buildFlowHighlight,
+  buildNightlySummary,
+  buildRegimeOutlook
 } from './formatter.js';
 
 import { startDiscordBot } from './discord-bot.js';
@@ -49,10 +51,8 @@ const WATCHLIST = (process.env.WATCHLIST || '')
   .map(t => t.trim().toUpperCase())
   .filter(Boolean)
   .slice(0, 50);
-const DIGEST_HOUR = parseInt(process.env.DIGEST_HOUR || '21', 10);
+const DIGEST_HOUR   = parseInt(process.env.DIGEST_HOUR   || '21', 10);
 const DIGEST_MINUTE = parseInt(process.env.DIGEST_MINUTE || '30', 10);
-const DARKPOOL_TICKER = (process.env.DARKPOOL_TICKER || 'SPY').toUpperCase();
-const ENABLE_MIDDAY_CHECK = (process.env.ENABLE_MIDDAY_CHECK || 'true').toLowerCase() === 'true';
 const ENABLE_PREMARKET = (process.env.ENABLE_PREMARKET || 'true').toLowerCase() === 'true';
 
 const TZ = 'America/New_York';
@@ -96,56 +96,14 @@ function route(channel) {
 
 // --- In-memory state ---
 const state = {
-  lastDarkpoolAggressor: null,
-  lastRegime: null,
-  lastWebhookPostAt: new Map() // webhookUrl -> timestamp
+  lastRegime: null,         // from signal-index, for nightly change detection
+  lastGexRegime: null,      // 'ABOVE_FLIP' | 'BELOW_FLIP' — from SPY GEX, updated hourly
+  lastCycleResults: [],     // [{ticker, signal, verdict}] from last hourly scan
+  lastCycleTime: null,      // ISO string
+  lastWebhookPostAt: new Map()
 };
 
-// Earnings tracker state — resets each day at 7 PM ET (after post-market closes).
-// Per-ticker keys tracked: posted60, posted15, postedFollowup,
-//                          preGrade, preScore, preDirection, reportedAt.
-const earningsState = {
-  lastResetDay: null,
-  tickers: new Map()
-};
-
-function resetEarningsStateIfNewDay() {
-  const today = new Date().toLocaleDateString('en-CA', { timeZone: TZ });
-  if (earningsState.lastResetDay !== today) {
-    earningsState.tickers.clear();
-    earningsState.lastResetDay = today;
-    console.log(`[${ts()}] 🔄 Earnings tracker reset for ${today}`);
-  }
-}
-
-// Map session label → assumed report time in ET.
-function reportTimeFor(timeLabel) {
-  if (timeLabel === 'pre-market')  return { hour: 8,  minute: 0 };
-  if (timeLabel === 'post-market') return { hour: 16, minute: 5 };
-  return { hour: 12, minute: 0 };
-}
-
-function minutesUntilReport(timeLabel) {
-  const t = reportTimeFor(timeLabel);
-  const now = new Date();
-  const tHHMM = now.toLocaleString('en-US', {
-    timeZone: TZ, hour12: false, hour: '2-digit', minute: '2-digit'
-  });
-  const [hh, mm] = tHHMM.split(':').map(Number);
-  const nowMin = hh * 60 + mm;
-  const reportMin = t.hour * 60 + t.minute;
-  return reportMin - nowMin;
-}
-
-function getTickerState(ticker) {
-  if (!earningsState.tickers.has(ticker)) {
-    earningsState.tickers.set(ticker, {
-      posted60: false, posted15: false, postedFollowup: false,
-      preGrade: null, preScore: null, preDirection: null, reportedAt: null
-    });
-  }
-  return earningsState.tickers.get(ticker);
-}
+let haltPolling = false; // set true on 401; cleared on process restart
 
 // ============================================================
 // Logging
@@ -163,8 +121,6 @@ function logErr(...args) {
   console.error(`[${ts()}]`, ...args);
 }
 
-// Plan info from /api/v1/me can be a string OR an object like
-// { id, name, tier, ... }. Normalize to a friendly display string.
 function formatPlan(plan) {
   if (plan == null) return null;
   if (typeof plan === 'string') return plan;
@@ -236,51 +192,7 @@ async function postToDiscord(webhookUrl, payload, jobLabel = 'job') {
   return false;
 }
 
-// ============================================================
-// Tier 3 enrichment helper
-// Fetches raw signal feed + per-ticker Action Cards, then builds
-// the refined Tier 3 alert and posts it to #micro.
-// ============================================================
-async function emitEnrichedTier3Alert(tier3, allScored, signalIndex, jobLabel) {
-  if (!tier3 || tier3.length === 0) return null;
-
-  // Fetch raw signal feed (for model attribution + agent-level levels)
-  let signalFeed = [];
-  try {
-    const feed = await getSignalFeed(200);
-    signalFeed = Array.isArray(feed?.signals) ? feed.signals
-              : Array.isArray(feed) ? feed
-              : [];
-  } catch (err) {
-    logErr(`  ⚠️  Tier 3 enrichment: signal feed unavailable: ${err.message}`);
-  }
-
-  // Fetch Action Cards for each Tier 3 ticker (typically 0-3)
-  const actionCards = {};
-  await Promise.all(
-    tier3.slice(0, 5).map(async (s) => {
-      const ticker = String(s.ticker || '').toUpperCase();
-      if (!ticker) return;
-      try {
-        const card = await getSignal(ticker);
-        actionCards[ticker] = card?.data ?? card?.action_card ?? card?.signal ?? card;
-      } catch (err) {
-        // Action Card is enrichment-only; alert still fires without it.
-        logErr(`  ⚠️  Action Card unavailable for ${ticker}: ${err.message}`);
-      }
-    })
-  );
-
-  const alert = buildTier3Alert(allScored, { signalFeed, signalIndex, actionCards });
-  if (alert) {
-    await postToDiscord(route('micro'), alert, jobLabel);
-    return alert;
-  }
-  return null;
-}
-
 // Detect 503/nightly_pipeline_pending from a getSignalIndex() rejection.
-// Returns true if the error looks like the pipeline wasn't ready yet.
 function isPipelinePendingError(reason) {
   const msg = String(reason?.message || reason || '');
   if (msg.includes('503')) return true;
@@ -289,19 +201,16 @@ function isPipelinePendingError(reason) {
   return false;
 }
 
-// One-shot retry of /signal-index 5 min after the digest. Updates
-// state.lastRegime and posts a regime-change alert if the regime shifted
-// from yesterday's. No-op for non-503 failures.
 let _signalIndexRetryPending = false;
 function scheduleSignalIndexRetry(reason) {
   if (!isPipelinePendingError(reason)) return false;
   if (_signalIndexRetryPending) {
-    log(`  signal-index retry already pending — not scheduling another`);
+    log('  signal-index retry already pending — not scheduling another');
     return false;
   }
   _signalIndexRetryPending = true;
   const delayMs = 5 * 60 * 1000;
-  log(`⏳ signal-index 503 (pipeline pending) — retrying in 5 min`);
+  log('⏳ signal-index 503 (pipeline pending) — retrying in 5 min');
 
   setTimeout(async () => {
     try {
@@ -326,300 +235,304 @@ function scheduleSignalIndexRetry(reason) {
 }
 
 // ============================================================
-// JOB 1 — Nightly digest
+// computeVerdict — 6-gate filter (brief §3)
+// ============================================================
+
+function computeVerdict(signalData, spyGex) {
+  const signa  = signalData?.signa  || {};
+  const data   = signalData?.data   || {};
+  const engine = signalData?.engine || {};
+
+  // engine staleness: only treat engine as fresh if runAt is within 1 trading day
+  const engineFresh = engine.runAt
+    ? (Date.now() - new Date(engine.runAt).getTime()) < 86_400_000
+    : false;
+
+  const intendedDir = String(signa.action || '').toUpperCase();
+
+  const gate1 = signa.alphaEvent === true;
+  const gate2 = ['A+', 'A'].includes(String(signa.grade || '').toUpperCase());
+  const gate3 = ['LONG', 'SHORT'].includes(intendedDir);
+  const gate4 = Number(signa.flowScore ?? 0) > 65;
+
+  // Gate 5 — regime alignment. Callers pass null for spyGex when the
+  // upstream read failed the plausibility check; in that case we record
+  // 'unavailable' (a non-boolean) so the card renders ⚠️ instead of ❌
+  // and the verdict can never reach CALL (CALL requires gate5 === true).
+  let gate5;
+  if (!spyGex || !spyGex.levels || typeof spyGex.levels.regimeAboveFlip !== 'boolean') {
+    gate5 = 'unavailable';
+  } else {
+    const regimeAbove = spyGex.levels.regimeAboveFlip;
+    gate5 = (intendedDir === 'LONG'  && regimeAbove === true)
+         || (intendedDir === 'SHORT' && regimeAbove === false);
+  }
+
+  const gate6 = data.stop != null && data.target != null;
+
+  const verdict = (gate1 && gate2 && gate3 && gate4 && gate5 === true && gate6) ? 'CALL' : 'NO-CALL';
+  return { verdict, gates: { gate1, gate2, gate3, gate4, gate5, gate6 }, engineFresh };
+}
+
+// sanitizeGex — wrap a getGex() result. Returns the raw GEX response if
+// it passes the plausibility check; otherwise logs a warning with the
+// upstream request_id and returns null. All call sites that consume
+// SPY/QQQ GEX must pipe through this so a corrupted flip never reaches
+// a regime card or gate-5 evaluation.
+function sanitizeGex(raw, label) {
+  if (!raw) return null;
+  if (isGexPlausible(raw)) return raw;
+  const lv = raw?.levels ?? {};
+  const reqId = raw.__requestId || 'n/a';
+  logErr(
+    `⚠️  GEX/${label} implausible (request_id=${reqId}): ` +
+    `flip=${lv.gammaFlipLevel} callWall=${lv.callWall} putWall=${lv.putWall} ` +
+    `— treating GEX as unavailable this cycle, suppressing regime publish.`
+  );
+  return null;
+}
+
+// ============================================================
+// checkQuota — read /me to verify remaining call budget.
+// Returns true if safe to proceed. On 401, sets haltPolling.
+// ============================================================
+
+async function checkQuota() {
+  if (haltPolling) {
+    log('⛔ Polling halted (401 received previously). Restart with a valid SIGNA_API_KEY.');
+    return false;
+  }
+  try {
+    const me = await getMe();
+    const remaining = me?.api?.calls_remaining ?? me?.calls_remaining ?? me?.quota?.remaining ?? null;
+    if (remaining !== null) {
+      log(`📊 Quota: ${remaining} calls remaining`);
+      if (remaining < 20) {
+        log('⚠️  Skipping cycle — fewer than 20 calls remaining this hour.');
+        return false;
+      }
+    }
+    return true;
+  } catch (err) {
+    if (/401/i.test(err.message)) {
+      haltPolling = true;
+      logErr('❌ API key invalid (401) — halting all polling. Fix SIGNA_API_KEY and restart.');
+      await postToDiscord(route('signals'), {
+        embeds: [{
+          title: '⛔ Signa Bot: API Key Invalid',
+          description: 'Received 401 from Signa API. All polling halted. Check SIGNA_API_KEY and restart.',
+          color: 0xFF4444,
+          timestamp: new Date().toISOString()
+        }]
+      }, 'halt-alert').catch(() => {});
+      return false;
+    }
+    logErr(`⚠️  Quota check failed (${err.message}) — proceeding`);
+    return true; // non-401 errors don't halt
+  }
+}
+
+// ============================================================
+// JOB 1 — Hourly scan (primary job, replaces midday + consensus)
+// /signal per watchlist ticker → GEX → 6-gate verdict → route
+// ============================================================
+
+async function runHourlyScan() {
+  log('───────────────────────────────────');
+  log('🔁 Running hourly scan…');
+  const t0 = Date.now();
+
+  if (haltPolling) { log('⛔ Scan skipped — polling halted (401).'); return; }
+
+  if (WATCHLIST.length === 0) {
+    log('⏭️  Hourly scan: WATCHLIST is empty — set the WATCHLIST env var.');
+    return;
+  }
+
+  if (!(await checkQuota())) return;
+
+  // 1. Sweep watchlist — 1500ms stagger between calls
+  const sweepResults = [];
+  for (let i = 0; i < WATCHLIST.length; i++) {
+    const ticker = WATCHLIST[i];
+    try {
+      const sig = await getSignal(ticker);
+      sweepResults.push({ ticker, signal: sig, error: null });
+    } catch (err) {
+      sweepResults.push({ ticker, signal: null, error: err.message });
+      logErr(`  signal failed for ${ticker}: ${err.message}`);
+    }
+    if (i < WATCHLIST.length - 1) await new Promise(r => setTimeout(r, 1500));
+  }
+
+  // 2. GEX — SPY primary, QQQ confirmation
+  const [spyRes, qqqRes] = await Promise.allSettled([getGex('SPY'), getGex('QQQ')]);
+  const spyRaw = spyRes.status === 'fulfilled' ? spyRes.value : null;
+  const qqqRaw = qqqRes.status === 'fulfilled' ? qqqRes.value : null;
+  if (!spyRaw) logErr(`  ⚠️  GEX/SPY failed: ${spyRes.reason?.message}`);
+  const spyGex = sanitizeGex(spyRaw, 'SPY');
+  const qqqGex = sanitizeGex(qqqRaw, 'QQQ');
+
+  // 3. Compute verdicts
+  const allResults = [];
+  for (const r of sweepResults) {
+    if (!r.signal) continue;
+    const verdict = computeVerdict(r.signal, spyGex);
+    allResults.push({ ticker: r.ticker, signal: r.signal, verdict });
+  }
+
+  // Cache for nightly summary
+  state.lastCycleResults = allResults;
+  state.lastCycleTime    = new Date().toISOString();
+
+  // 4. CALL verdicts → #signals
+  const callResults = allResults.filter(r => r.verdict.verdict === 'CALL');
+  for (const r of callResults) {
+    const card = buildCallCard(r.ticker, r.signal, spyGex, r.verdict);
+    if (card) await postToDiscord(route('signals'), card, `hourly-call-${r.ticker}`);
+  }
+
+  // 5. Watchlist grid → #micro
+  if (allResults.length > 0) {
+    const grid = buildWatchlistGrid(allResults);
+    if (grid) await postToDiscord(route('micro'), grid, 'hourly-grid');
+  }
+
+  // 6. GEX regime → #macro on flip
+  if (spyGex?.levels) {
+    const regimeAbove  = spyGex.levels.regimeAboveFlip;
+    const newGexRegime = regimeAbove === true ? 'ABOVE_FLIP' : regimeAbove === false ? 'BELOW_FLIP' : null;
+    if (newGexRegime && newGexRegime !== state.lastGexRegime) {
+      log(`  GEX regime flip: ${state.lastGexRegime ?? 'none'} → ${newGexRegime}`);
+      const regimeMsg = buildRegimeUpdate(spyGex, qqqGex);
+      if (regimeMsg) await postToDiscord(route('macro'), regimeMsg, 'hourly-regime-flip');
+      state.lastGexRegime = newGexRegime;
+    }
+  }
+
+  // 7. Flow highlights → #darkpool (flowScore > 75)
+  const FLOW_ALERT_THRESHOLD = 75;
+  const flowHits = allResults.filter(r => Number(r.signal?.signa?.flowScore ?? 0) > FLOW_ALERT_THRESHOLD);
+  for (const r of flowHits) {
+    const msg = buildFlowHighlight(r.ticker, r.signal);
+    if (msg) await postToDiscord(route('darkpool'), msg, `hourly-flow-${r.ticker}`);
+  }
+
+  const ms = Date.now() - t0;
+  log(`✓ Hourly scan: ${WATCHLIST.length} tickers swept, ${allResults.length} signals, ${callResults.length} CALLs, ${flowHits.length} flow alerts — ${ms}ms`);
+  log('───────────────────────────────────');
+}
+
+// ============================================================
+// JOB 2 — Nightly digest (DIGEST_HOUR:DIGEST_MINUTE ET)
+// Regime outlook → #macro. CALL summary → #signals.
 // ============================================================
 
 async function runNightlyDigest() {
   log('───────────────────────────────────');
   log('📊 Running nightly digest…');
-
   const t0 = Date.now();
 
-  const [signalIndexRes, scoredRes, darkpoolRes, calendarRes, screenerRes] =
-    await Promise.allSettled([
-      getSignalIndex(),
-      getScoredSignals(200),
-      getDarkPool(DARKPOOL_TICKER, 100),
-      getCalendar(1),
-      WATCHLIST.length > 0 ? screenTickers(WATCHLIST) : Promise.resolve(null)
-    ]);
+  const [signalIndexRes, spyGexRes] = await Promise.allSettled([
+    getSignalIndex(),
+    getGex('SPY')
+  ]);
 
   const signalIndex = signalIndexRes.status === 'fulfilled' ? signalIndexRes.value : null;
-  let scored = scoredRes.status === 'fulfilled' ? scoredRes.value : [];
-  if (!Array.isArray(scored)) scored = scored?.signals || scored?.results || [];
-  const darkpool = darkpoolRes.status === 'fulfilled' ? darkpoolRes.value : null;
-  const calendar = calendarRes.status === 'fulfilled' ? calendarRes.value : null;
-  const screener = screenerRes.status === 'fulfilled' ? screenerRes.value : null;
+  const spyRaw      = spyGexRes.status      === 'fulfilled' ? spyGexRes.value      : null;
+  const spyGex      = sanitizeGex(spyRaw, 'SPY');
 
-  // Log any failures
-  for (const [name, r] of [
-    ['signal-index', signalIndexRes],
-    ['scored-signals', scoredRes],
-    ['darkpool', darkpoolRes],
-    ['calendar', calendarRes],
-    ['screener', screenerRes]
-  ]) {
-    if (r.status === 'rejected') logErr(`  ⚠️  ${name} failed: ${r.reason?.message || r.reason}`);
-  }
-
-  // The 21:30 digest sometimes races Signa's nightly pipeline. If
-  // /signal-index returned 503/nightly_pipeline_pending, schedule a single
-  // retry 5 min later so the regime baseline + regime-change alert still fire.
   if (signalIndexRes.status === 'rejected') {
+    logErr(`  ⚠️  signal-index failed: ${signalIndexRes.reason?.message}`);
     scheduleSignalIndexRetry(signalIndexRes.reason);
   }
 
-  // Regime change detection
+  // Regime change detection (signal-index derived)
   if (signalIndex?.regime && state.lastRegime && state.lastRegime !== signalIndex.regime) {
     const change = buildRegimeChange(state.lastRegime, signalIndex.regime);
     await postToDiscord(route('macro'), change, 'regime-change');
   }
   if (signalIndex?.regime) state.lastRegime = signalIndex.regime;
 
-  // 1) Main digest
-  const digest = buildDailyDigest(signalIndex, scored, calendar, darkpool, WATCHLIST);
-  await postToDiscord(route('signals'), digest, 'nightly-digest');
+  // 1) Regime outlook → #macro
+  const outlook = buildRegimeOutlook(signalIndex, spyGex);
+  if (outlook) await postToDiscord(route('macro'), outlook, 'nightly-regime-outlook');
 
-  // 2) Tier 3 alerts — enriched with raw feed, signal index, and Action Cards
-  const tier3 = scored.filter(s => Number(s.alert_tier ?? s.tier) === 3);
-  if (tier3.length > 0) {
-    const alert = await emitEnrichedTier3Alert(tier3, scored, signalIndex, 'tier3-alert');
-    if (!alert) log('  Tier 3 enrichment returned no alert');
-  }
-
-  // 3) Watchlist summary
-  if (screener) {
-    const wl = buildWatchlistSummary(screener, WATCHLIST);
-    if (wl) await postToDiscord(route('signals'), wl, 'watchlist-summary');
-  }
+  // 2) CALL summary → #signals
+  const summary = buildNightlySummary(signalIndex, state.lastCycleResults, state.lastCycleTime);
+  if (summary) await postToDiscord(route('signals'), summary, 'nightly-summary');
 
   const ms = Date.now() - t0;
-  log(`✓ Digest complete in ${ms}ms — ${scored.length} scored, ${tier3.length} tier3, regime ${signalIndex?.regime || 'UNKNOWN'}`);
+  log(`✓ Digest complete in ${ms}ms — regime ${signalIndex?.regime || 'UNKNOWN'}, ${state.lastCycleResults?.length || 0} in last cycle`);
   log('───────────────────────────────────');
 }
 
 // ============================================================
-// JOB 2 — Midday Tier 3 sweep
-// ============================================================
-
-async function runMiddayCheck() {
-  log('☀️ Midday Tier 3 sweep…');
-  try {
-    const [scoredRes, signalIndexRes] = await Promise.allSettled([
-      getScoredSignals(200),
-      getSignalIndex()
-    ]);
-    let scored = scoredRes.status === 'fulfilled' ? scoredRes.value : [];
-    if (!Array.isArray(scored)) scored = scored?.signals || scored?.results || [];
-    const signalIndex = signalIndexRes.status === 'fulfilled' ? signalIndexRes.value : null;
-
-    const tier3 = scored.filter(s => Number(s.alert_tier ?? s.tier) === 3);
-    if (tier3.length === 0) {
-      log('  No Tier 3 signals at midday.');
-      return;
-    }
-    await emitEnrichedTier3Alert(tier3, scored, signalIndex, 'midday-tier3');
-  } catch (err) {
-    logErr(`❌ midday-check failed: ${err.message}`);
-  }
-}
-
-// ============================================================
-// JOB 3 — Pre-market brief
+// JOB 3 — Pre-market brief (09:00 ET)
+// GEX regime → #macro. Watchlist screener → #signals.
 // ============================================================
 
 async function runPremarketBrief() {
   log('🌅 Pre-market brief…');
   try {
-    const [calRes, scoredRes] = await Promise.allSettled([
-      getCalendar(1),
-      getScoredSignals(200)
+    const [signalIndexRes, spyGexRes, qqqGexRes, screenerRes] = await Promise.allSettled([
+      getSignalIndex(),
+      getGex('SPY'),
+      getGex('QQQ'),
+      WATCHLIST.length > 0 ? screenTickers(WATCHLIST) : Promise.resolve(null)
     ]);
-    const calendar = calRes.status === 'fulfilled' ? calRes.value : { earnings: [] };
-    let scored = scoredRes.status === 'fulfilled' ? scoredRes.value : [];
-    if (!Array.isArray(scored)) scored = scored?.signals || scored?.results || [];
 
-    // Cross-reference watchlist with active signals
-    const watchSet = new Set(WATCHLIST);
-    const watchlistSignals = scored.filter(s => watchSet.has(s.ticker?.toUpperCase()));
+    const signalIndex = signalIndexRes.status === 'fulfilled' ? signalIndexRes.value : null;
+    const spyRaw      = spyGexRes.status      === 'fulfilled' ? spyGexRes.value      : null;
+    const qqqRaw      = qqqGexRes.status      === 'fulfilled' ? qqqGexRes.value      : null;
+    const spyGex      = sanitizeGex(spyRaw, 'SPY');
+    const qqqGex      = sanitizeGex(qqqRaw, 'QQQ');
+    const screener    = screenerRes.status     === 'fulfilled' ? screenerRes.value    : null;
 
-    const brief = buildPremarketBrief(calendar, {
-      signals: watchlistSignals,
-      watchlist: WATCHLIST
-    });
-    await postToDiscord(route('signals'), brief, 'premarket-brief');
+    for (const [name, r] of [
+      ['signal-index', signalIndexRes],
+      ['GEX SPY',      spyGexRes],
+      ['GEX QQQ',      qqqGexRes],
+      ['screener',     screenerRes]
+    ]) {
+      if (r.status === 'rejected') logErr(`  ⚠️  ${name} failed: ${r.reason?.message}`);
+    }
+
+    // Regime update → #macro (GEX walls + signal-index)
+    const regimeMsg = buildRegimeUpdate(spyGex, qqqGex);
+    if (regimeMsg) await postToDiscord(route('macro'), regimeMsg, 'premarket-regime');
+
+    // Screener candidates → #signals
+    if (screener) {
+      const brief = buildWatchlistSummary(screener, WATCHLIST);
+      if (brief) await postToDiscord(route('signals'), brief, 'premarket-screener');
+    }
   } catch (err) {
     logErr(`❌ premarket-brief failed: ${err.message}`);
   }
 }
 
 // ============================================================
-// JOB 4 — Dark pool anomaly check (every 30 min market hours)
+// Disabled stubs — undocumented endpoints / out of scope
 // ============================================================
 
-// Minimum dollar volume on the dominant side before a dark pool alert
-// is worth firing. Sub-$10M flips are routine market noise.
-const DARKPOOL_MIN_DOLLAR_VOLUME = 10_000_000;
-
-async function runDarkpoolCheck() {
-  try {
-    const dp = await getDarkPool(DARKPOOL_TICKER, 100);
-    const summary = dp?.summary;
-    if (!summary) return;
-
-    const agg = summary.net_aggressor;
-    const buy = Number(summary.buy_premium || 0);
-    const sell = Number(summary.sell_premium || 0);
-
-    const aggressorChanged = state.lastDarkpoolAggressor !== null
-      && state.lastDarkpoolAggressor !== agg;
-    const meetsThreshold = Math.max(buy, sell) >= DARKPOOL_MIN_DOLLAR_VOLUME;
-
-    // Only fire on a true aggressor flip backed by meaningful dollar volume.
-    // SELL→SELL (or any same-side repeat) is suppressed because the imbalance
-    // direction has not changed, and sub-threshold flips are market noise.
-    const shouldAlert = aggressorChanged && meetsThreshold;
-
-    if (shouldAlert) {
-      log(`🌊 Dark pool anomaly: ${state.lastDarkpoolAggressor || '—'} → ${agg}, buy=${buy}, sell=${sell}`);
-      const alert = buildDarkPoolAlert(summary, DARKPOOL_TICKER);
-      if (alert) await postToDiscord(route('micro'), alert, 'darkpool-anomaly');
-    } else if (state.lastDarkpoolAggressor !== null && (aggressorChanged || meetsThreshold)) {
-      // Diagnostic: log near-misses so we can tune the threshold later.
-      log(`🌊 Dark pool noise: ${state.lastDarkpoolAggressor} → ${agg}, buy=${buy}, sell=${sell} — suppressed (changed=${aggressorChanged}, threshold=${meetsThreshold})`);
-    }
-    state.lastDarkpoolAggressor = agg;
-  } catch (err) {
-    logErr(`❌ darkpool-check failed: ${err.message}`);
-  }
+function runDarkpoolCheck() {
+  // /api/darkpool/prints is not available on the Founding plan.
+  // Flow data is available via signa.flowScore in the hourly scan → #darkpool.
 }
 
-// ============================================================
-// JOB 5 — Earnings Action Cards (Phase 2)
-// Runs every 5 min, 7 AM – 7 PM ET weekdays. For each watchlist ticker
-// or Grade-A pipeline ticker reporting today: post a 60-min Action Card,
-// a 15-min pulse, and a follow-up after the print completes.
-// ============================================================
+function runEarningsCheck() {
+  // /api/calendar is not available on the Founding plan.
+  // get_fundamentals is Professional-gated. #earnings channel kept for future use.
+}
 
-async function runEarningsCheck() {
-  resetEarningsStateIfNewDay();
-
-  let calendar, scored;
-  try {
-    [calendar, scored] = await Promise.all([
-      getCalendar(1),
-      getScoredSignals(200)
-    ]);
-  } catch (err) {
-    logErr(`❌ earnings-check: failed to fetch calendar/signals: ${err.message}`);
-    return;
-  }
-
-  if (!Array.isArray(scored)) scored = scored?.signals || scored?.results || [];
-
-  // Today's earnings (ET-local date)
-  const todayET = new Date().toLocaleDateString('en-CA', { timeZone: TZ });
-  const todays = (calendar?.earnings || []).filter(e => e.date === todayET);
-  if (todays.length === 0) return;
-
-  // Build candidate set: watchlist tickers + Grade A scored tickers
-  const watchSet = new Set(WATCHLIST);
-  const gradeASet = new Set(
-    scored
-      .filter(s => String(s.grade || '').toUpperCase() === 'A')
-      .map(s => String(s.ticker || '').toUpperCase())
-  );
-  const candidates = todays.filter(e => {
-    const tk = String(e.ticker || '').toUpperCase();
-    return watchSet.has(tk) || gradeASet.has(tk);
-  });
-  if (candidates.length === 0) return;
-
-  for (const earn of candidates) {
-    const ticker = String(earn.ticker || '').toUpperCase();
-    if (!ticker) continue;
-
-    const minsToReport = minutesUntilReport(earn.time);
-    const tState = getTickerState(ticker);
-
-    // === T-60 post (window: 65 to 45 min before report) ===
-    if (!tState.posted60 && minsToReport <= 65 && minsToReport >= 45) {
-      try {
-        const [actionCard, quote] = await Promise.all([
-          getSignal(ticker).catch(() => null),
-          getQuote(ticker).catch(() => null)
-        ]);
-        const payload = buildEarningsActionCard60(ticker, actionCard, earn, quote);
-        const ok = await postToDiscord(route('earnings'), payload, `earnings-T60-${ticker}`);
-        if (ok) {
-          tState.posted60 = true;
-          // Cache the pre-earnings grade for the follow-up post.
-          const d = (actionCard?.data ?? actionCard?.action_card ?? actionCard?.signal ?? actionCard) || {};
-          tState.preGrade = String(d.grade ?? d.letter_grade ?? '?').toUpperCase();
-          tState.preScore = d.score ?? d.composite_score ?? null;
-          tState.preDirection = String(d.direction ?? d.bias ?? d.action ?? 'NEUTRAL').toUpperCase();
-        }
-      } catch (err) {
-        logErr(`❌ earnings T-60 failed for ${ticker}: ${err.message}`);
-      }
-    }
-
-    // === T-15 pulse (window: 20 to 5 min before report) ===
-    if (tState.posted60 && !tState.posted15 && minsToReport <= 20 && minsToReport >= 5) {
-      try {
-        const [actionCard, quote] = await Promise.all([
-          getSignal(ticker).catch(() => null),
-          getQuote(ticker).catch(() => null)
-        ]);
-        const payload = buildEarningsActionCard15(ticker, actionCard, earn, quote, tState.preGrade);
-        const ok = await postToDiscord(route('earnings'), payload, `earnings-T15-${ticker}`);
-        if (ok) tState.posted15 = true;
-      } catch (err) {
-        logErr(`❌ earnings T-15 failed for ${ticker}: ${err.message}`);
-      }
-    }
-
-    // === Mark report time once we cross zero ===
-    if (tState.posted60 && tState.reportedAt == null && minsToReport <= 0) {
-      tState.reportedAt = Date.now();
-    }
-
-    // === Follow-up (90 min after report, only if pre-grade was A) ===
-    if (
-      tState.reportedAt != null &&
-      !tState.postedFollowup &&
-      tState.preGrade?.startsWith('A') &&
-      Date.now() - tState.reportedAt >= 90 * 60 * 1000
-    ) {
-      try {
-        const quote = await getQuote(ticker).catch(() => null);
-        if (!quote || quote.change_pct == null) {
-          logErr(`⏭️  earnings follow-up: ${ticker} no quote yet, will retry next tick`);
-          continue;
-        }
-        const payload = buildEarningsFollowUp(
-          ticker,
-          tState.preGrade,
-          tState.preScore,
-          tState.preDirection,
-          quote,
-          earn
-        );
-        if (payload) {
-          const ok = await postToDiscord(route('earnings'), payload, `earnings-followup-${ticker}`);
-          if (ok) tState.postedFollowup = true;
-        } else {
-          tState.postedFollowup = true; // skip if no useful payload
-        }
-      } catch (err) {
-        logErr(`❌ earnings follow-up failed for ${ticker}: ${err.message}`);
-      }
-    }
-  }
+function runConsensusCheck() {
+  // Replaced by hourly scan CALL verdict routing to #signals.
 }
 
 // ============================================================
 // On-demand: lookupTicker (exported for slash-command use)
+// Uses getSignal() + getGex() instead of deprecated endpoints.
 // ============================================================
 
 export async function lookupTicker(ticker) {
@@ -627,230 +540,40 @@ export async function lookupTicker(ticker) {
   const t = String(ticker).trim().toUpperCase();
   log(`🔍 Looking up ${t}…`);
 
-  const [enhancedRes, quoteRes, dpRes] = await Promise.allSettled([
-    getEnhancedSignal(t),
+  const [signalRes, quoteRes, gexRes] = await Promise.allSettled([
+    getSignal(t),
     getQuote(t),
-    getDarkPool(t, 20)
+    getGex(t)
   ]);
 
-  const enhanced = enhancedRes.status === 'fulfilled' ? enhancedRes.value : null;
-  const quote = quoteRes.status === 'fulfilled' ? quoteRes.value : null;
+  const signal = signalRes.status === 'fulfilled' ? signalRes.value : null;
+  const quote  = quoteRes.status  === 'fulfilled' ? quoteRes.value  : null;
+  const gexRaw = gexRes.status    === 'fulfilled' ? gexRes.value    : null;
+  const gex    = sanitizeGex(gexRaw, t);
 
-  if (!enhanced && !quote) {
+  if (!signal && !quote) {
     logErr(`  No data for ${t}`);
     return false;
   }
 
-  const payload = buildTickerAlert(t, quote, enhanced);
+  const payload = buildSignaSlashResponse(t, signal, quote) || buildTickerAlert(t, signal || quote, null);
   return postToDiscord(route('lookups'), payload, `lookup-${t}`);
 }
 
 // ============================================================
-// On-demand: runBacktestForTicker (Phase 2 Feature 3)
-//
-// Runs a backtest for a single ticker with the swing-default profile,
-// fetches an SPY benchmark over the same window, and posts both to
-// #backtest. Used by --backtest CLI flag and (later) by the slash
-// command.
+// Backtest — not available on Founding plan
 // ============================================================
 
-// Default exit profiles. The slash command will let the user pick.
 export const BACKTEST_PROFILES = {
   swing:    { stopLoss: 0.05, takeProfit: 0.10, holdingPeriod: 30 },
-  daytrade: { stopLoss: 0.02, takeProfit: 0.04, holdingPeriod: 5 },
+  daytrade: { stopLoss: 0.02, takeProfit: 0.04, holdingPeriod: 5  },
   position: { stopLoss: 0.08, takeProfit: 0.20, holdingPeriod: 90 }
 };
 
-// Compute a default 2-year window ending today (ET).
-function defaultBacktestWindow() {
-  const todayET = new Date().toLocaleDateString('en-CA', { timeZone: TZ });
-  const start = new Date(todayET);
-  start.setFullYear(start.getFullYear() - 2);
-  return {
-    startDate: start.toISOString().slice(0, 10),
-    endDate: todayET
-  };
-}
-
-export async function runBacktestForTicker(ticker, options = {}) {
-  if (!ticker) throw new Error('runBacktestForTicker: ticker required');
-  const t = String(ticker).trim().toUpperCase();
-  log(`📊 Backtesting ${t}…`);
-
-  const profileName = options.profile || 'swing';
-  const profile = BACKTEST_PROFILES[profileName] || BACKTEST_PROFILES.swing;
-  const win = options.window || defaultBacktestWindow();
-
-  const params = {
-    symbol: t,
-    startDate: options.startDate || win.startDate,
-    endDate: options.endDate || win.endDate,
-    initialCapital: options.initialCapital || 100000,
-    positionSize: options.positionSize || 0.1,
-    ...profile
-  };
-
-  // Fetch ticker backtest + SPY benchmark in parallel
-  const [tickerBT, spyBT] = await Promise.allSettled([
-    runBacktest(params),
-    runBacktest({ ...params, symbol: 'SPY' })
-  ]);
-
-  if (tickerBT.status === 'rejected') {
-    logErr(`❌ Backtest failed for ${t}: ${tickerBT.reason?.message || tickerBT.reason}`);
-    return false;
-  }
-
-  const opts = {
-    spyBacktest: spyBT.status === 'fulfilled' ? spyBT.value : null
-  };
-  if (spyBT.status === 'rejected') {
-    logErr(`  ⚠️  SPY benchmark failed: ${spyBT.reason?.message || spyBT.reason} — posting without benchmark`);
-  }
-
-  const payload = buildBacktestResult(t, tickerBT.value, opts);
-  if (!payload) {
-    logErr(`❌ Backtest payload empty for ${t}`);
-    return false;
-  }
-
-  const ok = await postToDiscord(route('backtest'), payload, `backtest-${t}`);
-  if (ok) {
-    const s = tickerBT.value.summary;
-    log(`  ✓ ${t}: ${s.totalTrades} trades, ${Math.round((s.winRate || 0) * 100)}% WR, ${s.totalReturnPercent?.toFixed(1)}% return`);
-  }
-  return ok;
-}
-
-// ============================================================
-// JOB 6 — Multi-Model Consensus Check (Phase 2 Feature 4)
-//
-// Runs at 21:35 ET weekdays (5 min after the nightly digest).
-// Pulls /api/signals/run?scored=true and fires an @here alert for any
-// ticker where ≥CONSENSUS_MIN_MODELS independent quant models agree on
-// direction with composite_score ≥ CONSENSUS_MIN_SCORE and no internal
-// conflict. Posts one alert per qualifying ticker to #signals.
-//
-// (Originally designed around an LLM consensus agent — Signa doesn't
-// expose one. The agent universe is ~19 quant/factor models across
-// ta/fundamental/macro categories, and the scored endpoint already
-// reports model_count + categories per signal. That's the consensus
-// metric we use.)
-// ============================================================
-
-const CONSENSUS_MIN_MODELS = 5;
-const CONSENSUS_MIN_SCORE = 80;
-const CONSENSUS_MAX_PER_DAY = 1;
-
-// State: track which (ticker, direction) we've alerted on today,
-// plus a global daily counter so we cap @here pings at
-// CONSENSUS_MAX_PER_DAY regardless of how many candidates pass the gate.
-const consensusAlertState = {
-  lastResetDay: null,
-  alerted: new Set(), // keys like "NVDA:BULLISH"
-  firedToday: 0
-};
-
-function resetConsensusStateIfNewDay() {
-  const today = new Date().toLocaleDateString('en-CA', { timeZone: TZ });
-  if (consensusAlertState.lastResetDay !== today) {
-    consensusAlertState.alerted.clear();
-    consensusAlertState.firedToday = 0;
-    consensusAlertState.lastResetDay = today;
-    log(`🔄 Consensus tracker reset for ${today}`);
-  }
-}
-
-async function runConsensusCheck(opts = {}) {
-  resetConsensusStateIfNewDay();
-  log('🎯 Running multi-model consensus check…');
-
-  let scored = null;
-  let signalIndex = null;
-  try {
-    const [scoredRes, idxRes] = await Promise.allSettled([
-      getScoredSignals(50),
-      getSignalIndex()
-    ]);
-    if (scoredRes.status === 'fulfilled') {
-      scored = scoredRes.value;
-    } else {
-      logErr(`❌ Consensus: scored signals fetch failed: ${scoredRes.reason?.message}`);
-      return;
-    }
-    if (idxRes.status === 'fulfilled') signalIndex = idxRes.value;
-  } catch (err) {
-    logErr(`❌ Consensus check failed at fetch: ${err.message}`);
-    return;
-  }
-
-  const rows = Array.isArray(scored?.signals) ? scored.signals : [];
-  if (rows.length === 0) {
-    log('  No scored signals returned.');
-    return;
-  }
-
-  const candidates = rows.filter(r => {
-    if (r.direction !== 'BULLISH' && r.direction !== 'BEARISH') return false;
-    if ((r.model_count || 0) < CONSENSUS_MIN_MODELS) return false;
-    if ((r.composite_score || 0) < CONSENSUS_MIN_SCORE) return false;
-    if (r.conflict_detected) return false;
-    return true;
-  });
-
-  if (candidates.length === 0) {
-    log(`  No multi-model consensus signals meet gate (≥${CONSENSUS_MIN_MODELS} models, score ≥${CONSENSUS_MIN_SCORE}, no conflict). Scanned ${rows.length} scored rows.`);
-    return;
-  }
-
-  // Sort by composite_score descending so the single daily alert
-  // (capped at CONSENSUS_MAX_PER_DAY) goes to the strongest candidate,
-  // not whichever the API returned first.
-  candidates.sort((a, b) => (b.composite_score || 0) - (a.composite_score || 0));
-
-  log(`  Found ${candidates.length} consensus candidate(s) of ${rows.length} scored rows. Building alerts…`);
-
-  let firedCount = 0;
-  for (const row of candidates) {
-    const ticker = String(row.ticker || '').toUpperCase();
-    if (!ticker) continue;
-
-    if (consensusAlertState.firedToday >= CONSENSUS_MAX_PER_DAY && !opts.force) {
-      log(`    ${ticker} ${row.direction}: daily cap reached (${CONSENSUS_MAX_PER_DAY}) — skipping remaining ${candidates.length - firedCount} candidate(s)`);
-      break;
-    }
-
-    const alertKey = `${ticker}:${row.direction}`;
-    if (consensusAlertState.alerted.has(alertKey) && !opts.force) {
-      log(`    ${ticker} ${row.direction}: already alerted today — skipping`);
-      continue;
-    }
-
-    let actionCard = null;
-    try {
-      const card = await getSignal(ticker);
-      actionCard = card?.data ?? card?.action_card ?? card?.signal ?? card;
-    } catch (err) {
-      logErr(`    ⚠️  Action Card fetch failed for ${ticker}: ${err.message}`);
-    }
-
-    log(`    ${ticker} ${row.direction}: ${row.model_count} models, score ${row.composite_score}, divers ${row.category_diversity ?? 0} → firing`);
-
-    const payload = buildConsensusAlert(row, {
-      actionCard,
-      regime: signalIndex?.regime
-    });
-    if (!payload) continue;
-
-    const ok = await postToDiscord(route('signals'), payload, `consensus-${ticker}`);
-    if (ok) {
-      consensusAlertState.alerted.add(alertKey);
-      consensusAlertState.firedToday++;
-      firedCount++;
-    }
-  }
-
-  log(`✓ Consensus check complete. Fired ${firedCount} alert(s).`);
+export async function runBacktestForTicker() {
+  throw new Error(
+    'Backtest is not available on the Founding plan — POST /api/v1/backtest is an undocumented endpoint.'
+  );
 }
 
 // ============================================================
@@ -859,7 +582,7 @@ async function runConsensusCheck(opts = {}) {
 
 function validateEnv() {
   const missing = [];
-  if (!SIGNA_API_KEY) missing.push('SIGNA_API_KEY');
+  if (!SIGNA_API_KEY)       missing.push('SIGNA_API_KEY');
   if (!DISCORD_WEBHOOK_URL) missing.push('DISCORD_WEBHOOK_URL');
 
   if (missing.length > 0) {
@@ -880,23 +603,28 @@ function fmtCron(min, hour) {
 
 async function startup() {
   console.log('\n╔════════════════════════════════════════╗');
-  console.log('║       SIGNA DISCORD BOT  v1.0.0        ║');
+  console.log('║       SIGNA DISCORD BOT  v2.0.0        ║');
   console.log('╚════════════════════════════════════════╝\n');
 
   validateEnv();
 
-  // Verify API key + log account info
+  // Verify API key, log account info, check scopes
   let me;
   try {
     me = await getMe();
-    log(`Account verified.`);
+    log('Account verified.');
     const planStr = formatPlan(me.plan ?? me.plan_name ?? me.tier);
     if (planStr) log(`  Plan:        ${planStr}`);
     if (me.scopes) log(`  Scopes:      ${Array.isArray(me.scopes) ? me.scopes.join(', ') : me.scopes}`);
-    const limit = me.rate_limit ?? me.plan?.rate_limit ?? me.plan?.rateLimit;
-    if (limit) log(`  Rate limit:  ${limit} req/min`);
-    if (me.calls_30d != null) log(`  Calls (30d): ${me.calls_30d}`);
-    if (me.quota) log(`  Quota:       ${JSON.stringify(me.quota)}`);
+    const remaining = me?.api?.calls_remaining ?? me?.calls_remaining ?? me?.quota?.remaining;
+    if (remaining != null) log(`  Quota:       ${remaining} calls remaining this hour`);
+    // Warn on potentially missing scopes
+    const scopes  = Array.isArray(me.scopes) ? me.scopes : [];
+    const needed  = ['signals', 'screener', 'options_flow'];
+    const missing = needed.filter(s => !scopes.includes(s));
+    if (missing.length > 0 && scopes.length > 0) {
+      logErr(`  ⚠️  Key may be missing scopes: ${missing.join(', ')} — some features may return 403.`);
+    }
   } catch (err) {
     logErr(`❌ Could not verify Signa account: ${err.message}`);
     logErr('   Bot will continue but jobs may fail. Check your SIGNA_API_KEY.');
@@ -904,7 +632,6 @@ async function startup() {
 
   log('');
   log(`Watchlist (${WATCHLIST.length}): ${WATCHLIST.join(', ') || '(empty)'}`);
-  log(`Dark-pool ticker: ${DARKPOOL_TICKER}`);
   log('');
   log('Channel routing:');
   for (const [name, url] of Object.entries(CHANNELS)) {
@@ -913,41 +640,37 @@ async function startup() {
     log(`  #${name.padEnd(9)} ${status}`);
   }
   log('');
+  log('Rate limit: 60 req/hr · 1,000/day (Founding plan)');
+  log(`Hourly scan: ${WATCHLIST.length} tickers + 2 GEX + 1 quota = ~${WATCHLIST.length + 3} calls/hr`);
+  log('');
   log('Scheduled jobs (America/New_York, weekdays):');
-  log(`  📊 Nightly digest      ${fmtCron(DIGEST_MINUTE, DIGEST_HOUR)}  Mon–Fri    → #signals + #micro (Tier 3)`);
-  if (ENABLE_MIDDAY_CHECK)  log(`  ☀️  Midday Tier 3 check  12:30 ET           Mon–Fri    → #micro`);
-  if (ENABLE_PREMARKET)     log(`  🌅 Pre-market brief    09:00 ET           Mon–Fri    → #signals`);
-  log(`  🌊 Dark pool sweep     :00/:30 9am-4pm ET   Mon–Fri    → #micro`);
-  log(`  📊 Earnings tracker    every 5 min 7am-7pm  Mon–Fri    → #earnings`);
-  log(`  🎯 Multi-model consensus 21:35 ET           Mon–Fri    → #signals (≥${CONSENSUS_MIN_MODELS} models, score ≥${CONSENSUS_MIN_SCORE}, max ${CONSENSUS_MAX_PER_DAY}/day)`);
+  log('  🔁 Hourly scan          :00 every hour     Mon–Fri    → #signals (CALLs) · #micro (grid) · #macro (regime flip) · #darkpool (flow)');
+  if (ENABLE_PREMARKET) {
+    log('  🌅 Pre-market brief    09:00 ET           Mon–Fri    → #macro (GEX) · #signals (screener)');
+  }
+  log(`  📊 Nightly digest      ${fmtCron(DIGEST_MINUTE, DIGEST_HOUR)}  Mon–Fri    → #macro (outlook) · #signals (CALL summary)`);
+  log('');
+  log('Disabled (undocumented endpoints on Founding plan):');
+  log('  🌊 Dark pool sweep     (flow data via signa.flowScore in hourly scan → #darkpool)');
+  log('  📅 Earnings tracker    (/api/calendar not on Founding; #earnings channel kept)');
+  log('  🎯 Multi-model consensus (replaced by hourly CALL verdict routing to #signals)');
   log('');
 
   // Schedule jobs
-  cron.schedule(`${DIGEST_MINUTE} ${DIGEST_HOUR} * * 1-5`, runNightlyDigest, { timezone: TZ });
-
-  if (ENABLE_MIDDAY_CHECK) {
-    cron.schedule('30 12 * * 1-5', runMiddayCheck, { timezone: TZ });
-  }
+  cron.schedule('0 * * * 1-5', runHourlyScan, { timezone: TZ });
 
   if (ENABLE_PREMARKET) {
     cron.schedule('0 9 * * 1-5', runPremarketBrief, { timezone: TZ });
   }
 
-  cron.schedule('*/30 9-16 * * 1-5', runDarkpoolCheck, { timezone: TZ });
-
-  // Earnings tracker — every 5 min, 7 AM – 7 PM ET, weekdays.
-  cron.schedule('*/5 7-19 * * 1-5', runEarningsCheck, { timezone: TZ });
-
-  // Multi-model consensus — 9:35 PM ET weekdays (5 min after nightly digest).
-  cron.schedule('35 21 * * 1-5', runConsensusCheck, { timezone: TZ });
+  cron.schedule(`${DIGEST_MINUTE} ${DIGEST_HOUR} * * 1-5`, runNightlyDigest, { timezone: TZ });
 
   // Startup notice to Discord
   const nextDigest = `${fmtCron(DIGEST_MINUTE, DIGEST_HOUR)} (Mon–Fri)`;
   const startupPayload = buildStartupNotice(me, nextDigest, WATCHLIST.length);
   await postToDiscord(route('signals'), startupPayload, 'startup');
 
-  // Discord Gateway bot for slash commands. Failure here MUST NOT crash
-  // the cron bot — webhooks keep working without the gateway.
+  // Discord Gateway bot for slash commands. Failure MUST NOT crash cron bot.
   try {
     await startDiscordBot();
   } catch (err) {
@@ -975,15 +698,13 @@ process.on('uncaughtException', (err) => {
 });
 
 // ============================================================
-// CLI flags — manually trigger a job and exit. Useful for testing.
-//   node bot.js --digest-now      → fire one nightly digest, exit
-//   node bot.js --premarket-now   → fire one pre-market brief, exit
-//   node bot.js --darkpool-now    → fire one dark-pool check, exit
-//   node bot.js --tier3-now       → fire one tier-3 sweep, exit
-//   node bot.js --earnings-now    → fire one earnings check, exit
-//   node bot.js --consensus-now   → fire one multi-model consensus check, exit
-//   node bot.js --backtest TICKER [profile] → run backtest, post to #backtest, exit
-//                                  profile: swing (default) | daytrade | position
+// CLI flags
+//   node bot.js --dry-run [TICKER]   → fetch signal + SPY GEX, compute verdict, log only
+//   node bot.js --post-test TICKER   → fetch signal + SPY GEX, build call card,
+//                                       POST only to DISCORD_TEST_WEBHOOK_URL, exit
+//   node bot.js --run-hourly-now     → run one hourly scan cycle and exit
+//   node bot.js --digest-now         → run nightly digest and exit
+//   node bot.js --premarket-now      → run pre-market brief and exit
 // ============================================================
 
 const cliArgs = process.argv.slice(2);
@@ -1001,37 +722,106 @@ async function runOneShot(label, fn) {
   }
 }
 
-if (cliArgs.includes('--digest-now')) {
+if (cliArgs.includes('--dry-run')) {
+  // Fetch signal + GEX, compute verdict, log to console — no Discord post
+  validateEnv();
+  const dryIdx    = cliArgs.indexOf('--dry-run');
+  const testTicker = (cliArgs[dryIdx + 1] && !cliArgs[dryIdx + 1].startsWith('--'))
+    ? cliArgs[dryIdx + 1].toUpperCase()
+    : 'NVDA';
+  console.log(`\n[${ts()}] Dry run — fetching ${testTicker} signal + SPY GEX…\n`);
+  (async () => {
+    try {
+      const [sig, spyRaw] = await Promise.all([getSignal(testTicker), getGex('SPY')]);
+      const spyGex = sanitizeGex(spyRaw, 'SPY');
+      const verdict = computeVerdict(sig, spyGex);
+
+      console.log(`\n=== ${testTicker} — signa surface ===`);
+      console.log(JSON.stringify(sig?.signa || sig, null, 2).slice(0, 1200));
+      console.log(`\n=== ${testTicker} — data surface ===`);
+      console.log(JSON.stringify(sig?.data || {}, null, 2).slice(0, 600));
+      console.log('\n=== SPY GEX levels ===');
+      console.log(spyGex
+        ? JSON.stringify(spyGex?.levels || spyGex, null, 2).slice(0, 600)
+        : `(unavailable — raw: ${JSON.stringify(spyRaw?.levels || spyRaw, null, 2).slice(0, 300)})`);
+      console.log('\n=== Verdict ===');
+      console.log(`VERDICT: ${verdict.verdict}`);
+      for (let i = 1; i <= 6; i++) {
+        const g = `gate${i}`;
+        const v = verdict.gates[g];
+        const mark = v === true ? '✅' : v === 'unavailable' ? '⚠️ ' : '❌';
+        console.log(`  ${mark} ${g}${v === 'unavailable' ? ' (unavailable)' : ''}`);
+      }
+      console.log('\n✓ Dry run complete — no Discord posts made.\n');
+      process.exit(0);
+    } catch (err) {
+      console.error(`\n❌ Dry run failed: ${err.message}\n`);
+      process.exit(1);
+    }
+  })();
+} else if (cliArgs.includes('--post-test')) {
+  // Fetch signal + GEX, build call card, POST only to DISCORD_TEST_WEBHOOK_URL, exit.
+  // Never starts the scheduler, the gateway client, or posts a startup card.
+  const postIdx = cliArgs.indexOf('--post-test');
+  const rawTicker = cliArgs[postIdx + 1];
+  if (!rawTicker || rawTicker.startsWith('--')) {
+    console.error('\n❌ --post-test requires a TICKER argument (e.g. `node bot.js --post-test NVDA`).\n');
+    process.exit(1);
+  }
+  const testTicker = rawTicker.toUpperCase();
+  const testWebhook = process.env.DISCORD_TEST_WEBHOOK_URL;
+  if (!SIGNA_API_KEY) {
+    console.error('\n❌ SIGNA_API_KEY is not set. Add it to .env before running --post-test.\n');
+    process.exit(1);
+  }
+  if (!testWebhook) {
+    console.error('\n❌ DISCORD_TEST_WEBHOOK_URL is not set. Add a #test channel webhook to .env first.\n');
+    process.exit(1);
+  }
+  console.log(`\n[${ts()}] Post-test — ${testTicker} → DISCORD_TEST_WEBHOOK_URL\n`);
+  (async () => {
+    try {
+      const [sig, spyRaw] = await Promise.all([getSignal(testTicker), getGex('SPY')]);
+      const spyGex = sanitizeGex(spyRaw, 'SPY');
+      const verdict = computeVerdict(sig, spyGex);
+      console.log(`Verdict: ${verdict.verdict}  (gate5=${verdict.gates.gate5})`);
+      const card = buildCallCard(testTicker, sig, spyGex, verdict, { isPreview: true });
+      if (!card) {
+        console.error('\n❌ buildCallCard returned empty payload — nothing to post.\n');
+        process.exit(1);
+      }
+      const ok = await postToDiscord(testWebhook, card, `post-test-${testTicker}`);
+      if (!ok) {
+        console.error('\n❌ Post-test failed — see error above.\n');
+        process.exit(1);
+      }
+      console.log(`\n✓ Post-test complete — card posted to test webhook.\n`);
+      process.exit(0);
+    } catch (err) {
+      console.error(`\n❌ Post-test failed: ${err.message}\n`);
+      process.exit(1);
+    }
+  })();
+} else if (cliArgs.includes('--run-hourly-now')) {
+  runOneShot('Hourly scan', runHourlyScan);
+} else if (cliArgs.includes('--digest-now')) {
   runOneShot('Nightly digest', runNightlyDigest);
 } else if (cliArgs.includes('--premarket-now')) {
   runOneShot('Pre-market brief', runPremarketBrief);
-} else if (cliArgs.includes('--darkpool-now')) {
-  runOneShot('Dark pool check', runDarkpoolCheck);
-} else if (cliArgs.includes('--tier3-now')) {
-  runOneShot('Tier-3 sweep', runMiddayCheck);
-} else if (cliArgs.includes('--earnings-now')) {
-  runOneShot('Earnings check', runEarningsCheck);
-} else if (cliArgs.includes('--consensus-now')) {
-  runOneShot('Multi-model consensus check', () => runConsensusCheck({ force: true }));
 } else if (cliArgs.includes('--backtest')) {
-  // node bot.js --backtest NVDA [profile]
-  const idx = cliArgs.indexOf('--backtest');
-  const ticker = cliArgs[idx + 1];
-  const profile = cliArgs[idx + 2];
-  if (!ticker || ticker.startsWith('--')) {
-    console.error('\n❌ Usage: node bot.js --backtest TICKER [profile]\n');
-    console.error('   profile: swing (default) | daytrade | position\n');
-    process.exit(1);
-  }
-  if (profile && !BACKTEST_PROFILES[profile]) {
-    console.error(`\n❌ Unknown profile "${profile}". Use: swing, daytrade, or position.\n`);
-    process.exit(1);
-  }
-  runOneShot(
-    `Backtest ${ticker.toUpperCase()} (${profile || 'swing'})`,
-    () => runBacktestForTicker(ticker, { profile: profile || 'swing' })
-  );
+  console.error('\n❌ Backtest is not available on the Founding plan.');
+  console.error('   POST /api/v1/backtest is an undocumented endpoint not included in Founding tier.\n');
+  process.exit(1);
 } else {
+  // Unknown flag guard: any --flag we did not match above must error out
+  // rather than silently fall through to launching the scheduled bot.
+  const unknownFlag = cliArgs.find(a => a.startsWith('--'));
+  if (unknownFlag) {
+    console.error(`\n❌ Unknown CLI flag: ${unknownFlag}`);
+    console.error('   Known flags: --dry-run [TICKER], --post-test TICKER, --run-hourly-now,');
+    console.error('                --digest-now, --premarket-now, --backtest\n');
+    process.exit(1);
+  }
   // Normal run — start scheduled bot
   startup().catch(err => {
     logErr(`Fatal startup error: ${err.message}`);
