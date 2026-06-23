@@ -237,6 +237,38 @@ export function isGexPlausible(gexData) {
   return flip >= lo && flip <= hi;
 }
 
+// Hysteresis band (fraction of the flip level) within which spot is treated
+// as sitting AT the flip — a neutral regime — rather than flipping the
+// boolean. Tunable via GEX_FLIP_NEUTRAL_BAND_PCT (in percent, e.g. "0.15").
+const _bandPct = Number(process.env.GEX_FLIP_NEUTRAL_BAND_PCT);
+export const GEX_FLIP_NEUTRAL_BAND =
+  (Number.isFinite(_bandPct) && _bandPct >= 0 ? _bandPct : 0.15) / 100;
+
+// deriveGexRegime — deterministic gamma regime from a SINGLE /gex snapshot.
+//
+// Reads the spot (underlying.price) and flip (gammaFlipLevel) from the SAME
+// response, so the result is a pure function of that one snapshot. This is
+// the fix for the regime flicker: Signa's `levels.regimeAboveFlip` boolean is
+// re-evaluated against a *live* spot at request time, so consecutive calls on
+// otherwise-identical data return true/false/true when price hovers at the
+// flip. Deriving from the snapshot's own spot removes that source mixing.
+//
+// A neutral band (GEX_FLIP_NEUTRAL_BAND) treats spot within ±band of the flip
+// as 'AT_FLIP', so sub-point noise at the boundary settles on one stable
+// state instead of oscillating the gate.
+//
+// Returns 'ABOVE' | 'BELOW' | 'AT_FLIP' | null  (null = insufficient data).
+export function deriveGexRegime(gexData, band = GEX_FLIP_NEUTRAL_BAND) {
+  const levels = gexData?.levels ?? {};
+  const flip = Number(levels.gammaFlipLevel ?? levels.flipLevel);
+  const spot = Number(gexData?.underlying?.price ?? gexData?.underlying?.regularClose);
+  if (!Number.isFinite(flip) || flip <= 0) return null;
+  if (!Number.isFinite(spot) || spot <= 0) return null;
+  const delta = (spot - flip) / flip;
+  if (Math.abs(delta) <= band) return 'AT_FLIP';
+  return delta > 0 ? 'ABOVE' : 'BELOW';
+}
+
 export function getEnhancedSignal() {
   throw new Error('getEnhancedSignal: /api/v1/enhanced-signal is not available on the Founding plan — use getSignal() instead.');
 }

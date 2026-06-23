@@ -8,10 +8,12 @@
 // Truncation is graceful — content is shortened, never dropped silently.
 // ============================================================
 
+import { deriveGexRegime } from './signa-client.js';
+
 // --- Visual constants ---
 export const TIER_EMOJI  = { 1: '🔵', 2: '🟡', 3: '🔴' };
 export const GRADE_EMOJI = { A: '🏆', B: '✅', C: '⚠️', D: '📉', F: '💀' };
-export const DIR_EMOJI   = { BULLISH: '📈', BEARISH: '📉', NEUTRAL: '➡️', LONG: '📈', SHORT: '📉' };
+export const DIR_EMOJI   = { BULLISH: '📈', BEARISH: '📉', NEUTRAL: '➡️', LONG: '📈', SHORT: '📉', BUY: '📈', SELL: '📉', AVOID: '📉', HOLD: '➡️', WAIT: '➡️' };
 export const REGIME_COLOR = { RISK_ON: 0x00FF88, TRANSITIONAL: 0xFFCC00, RISK_OFF: 0xFF4444 };
 export const DIR_COLOR    = { BULLISH: 0x00FF88, BEARISH: 0xFF4444, NEUTRAL: 0xFFCC00, LONG: 0x00FF88, SHORT: 0xFF4444 };
 
@@ -73,6 +75,91 @@ function priorityScore(s) {
   if (tier === 2 && (dir === 'BEARISH' || dir === 'SHORT')) return 600 + score;
   if (tier === 1 && grade === 'A') return 400 + score;
   return score;
+}
+
+// ============================================================
+// Shared ranking + regime helpers (used by the #micro ranked feed
+// and the #macro outlook so both order names the same way).
+// ============================================================
+
+// Letter grade → numeric rank, for tie-breaking equal scores.
+const _GRADE_ORDER = { 'A+': 7, 'A': 6, 'B+': 5, 'B': 4, 'C': 3, 'D': 2, 'F': 1 };
+function gradeRank(grade) {
+  return _GRADE_ORDER[String(grade || '').toUpperCase()] ?? 0;
+}
+
+// signaScore — the 0-100 "Signa score" used for ranking. The per-ticker
+// /signal surface exposes it as `signa.conviction`; fall back to other shapes.
+export function signaScore(signal) {
+  const sg = signal?.signa || {};
+  const d  = signal?.data  || {};
+  return Number(sg.conviction ?? sg.score ?? d.confidence ?? 0) || 0;
+}
+
+// topDriver — the single dominant "why" for a name: highest-strength trigger
+// from the signa surface, falling back to the highest-weighted data trigger.
+// Returns a short human string (description preferred over name) or null.
+export function topDriver(signal) {
+  const pick = (arr, key) => (Array.isArray(arr) ? arr : [])
+    .slice()
+    .sort((a, b) => (Number(b?.[key]) || 0) - (Number(a?.[key]) || 0))[0];
+  const t = pick(signal?.signa?.triggers, 'strength');
+  let why = t?.description || t?.name;
+  if (!why) {
+    const dt = pick(signal?.data?.triggers, 'weight');
+    why = dt?.description || dt?.name;
+  }
+  return why || null;
+}
+
+// leanEmoji — directional lean from a free-form action verb (BUY, ACCUMULATE,
+// HOLD, AVOID, DISTRIBUTE, …), fuzzy-matched so unseen verbs still resolve.
+function leanEmoji(action) {
+  const a = String(action || '').toUpperCase();
+  const has = (...words) => words.some(w => a.includes(w));
+  if (has('BUY', 'LONG', 'BULL', 'ACCUMULAT', 'OVERWEIGHT')) return '📈';
+  if (has('SELL', 'SHORT', 'BEAR', 'AVOID', 'REDUCE', 'TRIM', 'DISTRIBUT', 'UNDERWEIGHT')) return '📉';
+  if (has('HOLD', 'WAIT', 'NEUTRAL', 'FLAT')) return '➡️';
+  return '·';
+}
+
+// rankResults — sort scan results ({ ticker, signal, verdict, gex }) by Signa
+// score descending (grade as tiebreak). Items without a signal are dropped.
+// Single source of truth so #micro and #macro agree on ordering.
+export function rankResults(results) {
+  return (results || [])
+    .filter(r => r?.signal)
+    .slice()
+    .sort((a, b) =>
+      signaScore(b.signal) - signaScore(a.signal) ||
+      gradeRank(b.signal?.signa?.grade) - gradeRank(a.signal?.signa?.grade) ||
+      String(a.ticker).localeCompare(String(b.ticker))
+    );
+}
+
+// gexRegimeLabel — 3-state regime label derived deterministically from a GEX
+// snapshot (spot vs flip with hysteresis). 'full' for prominent cards, 'short'
+// for inline use. Returns null/'—' when the snapshot is insufficient.
+function gexRegimeLabel(gexData, style = 'full') {
+  const r = deriveGexRegime(gexData);
+  if (style === 'short') {
+    return r === 'ABOVE'   ? '🟢 above flip'
+         : r === 'BELOW'   ? '🔴 below flip'
+         : r === 'AT_FLIP' ? '⚪ at flip'
+         : '—';
+  }
+  return r === 'ABOVE'   ? '🟢 ABOVE FLIP — bullish gamma'
+       : r === 'BELOW'   ? '🔴 BELOW FLIP — bearish gamma'
+       : r === 'AT_FLIP' ? '⚪ AT FLIP — neutral gamma'
+       : null;
+}
+
+// gexRegimeColor — embed color matching the derived regime.
+function gexRegimeColor(gexData) {
+  const r = deriveGexRegime(gexData);
+  return r === 'ABOVE' ? REGIME_COLOR.RISK_ON
+       : r === 'BELOW' ? REGIME_COLOR.RISK_OFF
+       : REGIME_COLOR.TRANSITIONAL;
 }
 
 export function sortByPriority(signals) {
@@ -1480,24 +1567,24 @@ export function buildCallCard(ticker, signalData, gexData, verdictResult, option
     fields.push({ name: 'Levels', value: posLines.join('  ·  '), inline: false });
   }
 
-  // GEX from spyGex. Callers pass null when the upstream read failed
-  // plausibility (e.g. flip wildly off the walls); in that case we must
-  // not publish a flip number, just say "unavailable this cycle".
+  // GEX from this ticker's OWN snapshot. Callers pass null when the upstream
+  // read failed plausibility (e.g. flip wildly off the walls); in that case we
+  // must not publish a flip number, just say "unavailable this cycle".
+  const gexFieldName = `GEX (${ticker})`;
   if (gexData == null) {
-    fields.push({ name: 'GEX (SPY)', value: '⚠️ unavailable this cycle (plausibility check failed)', inline: false });
+    fields.push({ name: gexFieldName, value: '⚠️ unavailable this cycle (plausibility check failed)', inline: false });
   } else {
     const gex = gexData?.levels ?? gexData ?? {};
-    const regimeAbove = gex.regimeAboveFlip;
     const gexLines = [];
     if (gex.gammaFlipLevel != null) gexLines.push(`Flip \`$${Number(gex.gammaFlipLevel).toFixed(2)}\``);
     if (gex.callWall       != null) gexLines.push(`Call Wall \`$${Number(gex.callWall).toFixed(2)}\``);
     if (gex.putWall        != null) gexLines.push(`Put Wall \`$${Number(gex.putWall).toFixed(2)}\``);
-    if (gexLines.length > 0 || regimeAbove != null) {
-      const regimeLabel = regimeAbove === true  ? '🟢 ABOVE FLIP — bullish gamma'
-                        : regimeAbove === false ? '🔴 BELOW FLIP — bearish gamma'
-                        : null;
+    // Regime label derived deterministically from the snapshot (spot vs flip),
+    // consistent with gate 5 — not the flickering raw regimeAboveFlip boolean.
+    const regimeLabel = gexRegimeLabel(gexData, 'full');
+    if (gexLines.length > 0 || regimeLabel) {
       const gexValue = [...gexLines, regimeLabel].filter(Boolean).join('  ·  ');
-      fields.push({ name: 'GEX (SPY)', value: gexValue, inline: false });
+      fields.push({ name: gexFieldName, value: gexValue, inline: false });
     }
   }
 
@@ -1522,14 +1609,14 @@ export function buildCallCard(ticker, signalData, gexData, verdictResult, option
     });
   }
 
-  // Gate footer. gates[g] === true is a pass, 'unavailable' marks a gate
-  // we deliberately couldn't evaluate (e.g. gate 5 with implausible GEX),
-  // anything else is a fail.
+  // Gate footer. gates[g] === true is a pass; 'unavailable' (GEX missing/
+  // implausible) and 'neutral' (price at the flip) are soft ⚠️ states that
+  // block a CALL without being a hard disagreement; anything else is a fail.
   const gates = verdictResult.gates || {};
   const gateStr = ['gate1', 'gate2', 'gate3', 'gate4', 'gate5', 'gate6']
     .map((g, i) => {
       const v = gates[g];
-      const mark = v === true ? '✅' : v === 'unavailable' ? '⚠️' : '❌';
+      const mark = v === true ? '✅' : (v === 'unavailable' || v === 'neutral') ? '⚠️' : '❌';
       return `${mark}g${i + 1}`;
     })
     .join(' ');
@@ -1557,59 +1644,64 @@ export function buildCallCard(ticker, signalData, gexData, verdictResult, option
 export function buildWatchlistGrid(results) {
   if (!results || results.length === 0) return null;
 
-  const calls   = results.filter(r => r.verdict?.verdict === 'CALL');
-  const noCalls = results.filter(r => r.verdict?.verdict !== 'CALL');
+  const ranked  = rankResults(results);          // strongest Signa score first
+  const callN   = results.filter(r => r.verdict?.verdict === 'CALL').length;
+  const noCallN = results.length - callN;
 
-  // First gate that failed for each NO-CALL
-  function firstFailGate(gates) {
-    if (!gates) return '?';
-    for (let i = 1; i <= 6; i++) {
-      if (!gates[`gate${i}`]) return `g${i}`;
+  // keyLevel — the single most relevant number for a name: the GEX wall/flip
+  // nearest to price (using the ticker's OWN GEX from the hourly sweep), else
+  // the trade entry. This is the "where do I look" anchor for the digest.
+  const keyLevel = (signal, gex) => {
+    const d = signal?.data || {};
+    const price = Number(d.price ?? d.entry);
+    const lv = gex?.levels || {};
+    const walls = [
+      lv.callWall       != null ? { label: 'cWall', v: Number(lv.callWall) }       : null,
+      lv.putWall        != null ? { label: 'pWall', v: Number(lv.putWall) }         : null,
+      lv.gammaFlipLevel != null ? { label: 'flip',  v: Number(lv.gammaFlipLevel) }  : null
+    ].filter(w => w && Number.isFinite(w.v));
+    if (Number.isFinite(price) && walls.length) {
+      walls.sort((a, b) => Math.abs(a.v - price) - Math.abs(b.v - price));
+      return `${walls[0].label} ${fmtPrice(walls[0].v)}`;
     }
-    return '—';
-  }
-
-  const fmtRow = (r) => {
-    const signa  = r.signal?.signa  || {};
-    const action = String(signa.action || '').toUpperCase();
-    const grade  = String(signa.grade  || '?').toUpperCase();
-    const flow   = signa.flowScore != null ? Math.round(Number(signa.flowScore)) : '—';
-    const dEmoji = DIR_EMOJI[action] || '·';
-    const gEmoji = GRADE_EMOJI[grade?.[0]] || '·';
-    return `${dEmoji}${gEmoji} \`${r.ticker.padEnd(5)}\` ${grade} ${action.slice(0, 5).padEnd(5)} flow:\`${String(flow).padEnd(3)}\``;
+    return d.entry != null ? `entry ${fmtPrice(d.entry)}` : null;
   };
 
-  const fields = [];
+  // One scannable line per name: rank · CALL/NO-CALL · dir · ticker · score ·
+  // grade · price + nearest level · the one-line "why".
+  const rows = ranked.map((r, i) => {
+    const signa  = r.signal?.signa || {};
+    const data   = r.signal?.data  || {};
+    const action = String(signa.action || '').toUpperCase();
+    const grade  = String(signa.grade  || '?').toUpperCase();
+    const score  = Math.round(signaScore(r.signal));
+    const isCall = r.verdict?.verdict === 'CALL';
+    const dEmoji = leanEmoji(action);
+    const mark   = isCall ? '⚡' : '▫️';
+    const price  = data.price != null ? fmtPrice(data.price)
+                 : data.entry != null ? fmtPrice(data.entry) : '—';
+    const level  = keyLevel(r.signal, r.gex);
+    const why    = topDriver(r.signal);
+    const anchor = [price, level].filter(Boolean).join(' · ');
+    const reason = why ? `_${trunc(why, 46)}_` : `_${action.toLowerCase() || 'no driver'}_`;
+    return `\`${String(i + 1).padStart(2)}\` ${mark}${dEmoji} \`${r.ticker.padEnd(5)}\` \`${String(score).padStart(2)}\` ${grade.padEnd(2)} · ${anchor} · ${reason}`;
+  });
 
-  if (calls.length > 0) {
-    let value = '';
-    for (const r of calls) {
-      const line = fmtRow(r) + '  ⚡CALL\n';
-      if ((value + line).length > 1000) break;
-      value += line;
-    }
-    fields.push({ name: `⚡ CALLs (${calls.length})`, value: value.trimEnd(), inline: false });
+  // Fit the ranked list into the 4096-char description budget; surface any
+  // overflow rather than silently dropping names.
+  let desc = `**${results.length}** ranked by Signa score  ·  ⚡ ${callN} CALL  ·  ▫️ ${noCallN} NO-CALL\n\n`;
+  let shown = 0;
+  for (const line of rows) {
+    if ((desc + line).length > 3900) break;
+    desc += line + '\n';
+    shown++;
   }
+  if (shown < rows.length) desc += `_…and ${rows.length - shown} more (score-ranked)_`;
 
-  // Top NO-CALLs that are grade A/A+ (worth seeing why they didn't pass)
-  const gradeANoCalls = noCalls.filter(r => ['A+', 'A'].includes(String(r.signal?.signa?.grade || '').toUpperCase()));
-  if (gradeANoCalls.length > 0) {
-    let value = '';
-    for (const r of gradeANoCalls.slice(0, 10)) {
-      const fail = firstFailGate(r.verdict?.gates);
-      const line = fmtRow(r) + `  ✗${fail}\n`;
-      if ((value + line).length > 1000) break;
-      value += line;
-    }
-    fields.push({ name: `Grade A/A+ · NO-CALL (${gradeANoCalls.length})`, value: value.trimEnd(), inline: false });
-  }
-
-  const totalNoCalls = noCalls.length;
   const embed = {
-    title: `📋 Hourly Watchlist Grid — ${nowET()}`,
+    title: `📈 Hourly Micro Feed — ${nowET()}`,
     color: 0x00CCFF,
-    description: `${results.length} tickers evaluated  ·  ${calls.length} CALLs  ·  ${totalNoCalls} NO-CALLs`,
-    fields,
+    description: desc.trimEnd(),
     footer: FOOTER,
     timestamp: new Date().toISOString()
   };
@@ -1625,13 +1717,10 @@ export function buildRegimeUpdate(spyGex, qqqGex) {
   const spyLevels = spyGex?.levels ?? spyGex ?? null;
   if (!spyLevels) return null;
 
-  const regimeAbove = spyLevels.regimeAboveFlip;
-  const regimeLabel = regimeAbove === true  ? '🟢 ABOVE FLIP — bullish gamma environment'
-                    : regimeAbove === false ? '🔴 BELOW FLIP — bearish gamma environment'
-                    : '⚪ Regime unknown';
-  const color = regimeAbove === true  ? REGIME_COLOR.RISK_ON
-              : regimeAbove === false ? REGIME_COLOR.RISK_OFF
-              : REGIME_COLOR.TRANSITIONAL;
+  // Regime derived deterministically from SPY's own spot vs flip (with a
+  // neutral band), not the flickering raw regimeAboveFlip boolean.
+  const regimeLabel = gexRegimeLabel(spyGex, 'full') || '⚪ Regime unknown';
+  const color = gexRegimeColor(spyGex);
 
   const fmtLevel = (n) => n != null ? `$${Number(n).toFixed(2)}` : '—';
 
@@ -1648,13 +1737,12 @@ export function buildRegimeUpdate(spyGex, qqqGex) {
 
   const qqqLevels = qqqGex?.levels ?? qqqGex ?? null;
   if (qqqLevels) {
-    const qqqAbove = qqqLevels.regimeAboveFlip;
     const qqqLine = [
       qqqLevels.gammaFlipLevel != null ? `Flip \`${fmtLevel(qqqLevels.gammaFlipLevel)}\`` : null,
       qqqLevels.callWall       != null ? `Call Wall \`${fmtLevel(qqqLevels.callWall)}\`` : null,
       qqqLevels.putWall        != null ? `Put Wall \`${fmtLevel(qqqLevels.putWall)}\``   : null
     ].filter(Boolean).join('  ·  ');
-    const qqqLabel = qqqAbove === true ? '🟢 above flip' : qqqAbove === false ? '🔴 below flip' : '—';
+    const qqqLabel = gexRegimeLabel(qqqGex, 'short');
     descLines.push(`**QQQ GEX:** ${qqqLine || '—'}  →  ${qqqLabel}`);
   }
 
@@ -1795,16 +1883,13 @@ export function buildRegimeOutlook(signalIndex, spyGex) {
   // GEX summary
   const spyLevels = spyGex?.levels ?? spyGex ?? null;
   if (spyLevels) {
-    const regimeAbove = spyLevels.regimeAboveFlip;
     const fmtLevel = (n) => n != null ? `$${Number(n).toFixed(2)}` : '—';
     const spyLine = [
       spyLevels.gammaFlipLevel != null ? `flip ${fmtLevel(spyLevels.gammaFlipLevel)}` : null,
       spyLevels.callWall       != null ? `cWall ${fmtLevel(spyLevels.callWall)}`       : null,
       spyLevels.putWall        != null ? `pWall ${fmtLevel(spyLevels.putWall)}`        : null
     ].filter(Boolean).join('  ');
-    const regimeLine = regimeAbove === true  ? '🟢 price above gamma flip'
-                     : regimeAbove === false ? '🔴 price below gamma flip'
-                     : '';
+    const regimeLine = gexRegimeLabel(spyGex, 'short');
     descLines.push(`**SPY GEX:** ${spyLine}  ${regimeLine}`);
   }
 
@@ -1820,6 +1905,72 @@ export function buildRegimeOutlook(signalIndex, spyGex) {
     title: `🌙 Regime Outlook — ${todayStr()}`,
     description: descLines.join('\n'),
     color,
+    footer: FOOTER,
+    timestamp: new Date().toISOString()
+  };
+
+  return { embeds: fitMessage([embed]) };
+}
+
+// ============================================================
+// buildMacroOutlook — scheduled twice-daily "day's outlook" for #macro
+// (12-hour cadence: ~09:15 ET pre-open and ~21:15 ET). Overall regime +
+// SPY/QQQ market-level gamma context + the top-5 tradeable names by score.
+// top5 is a score-ranked slice of scan results ({ ticker, signal, ... }),
+// produced by rankResults() — the SAME ranking the #micro feed uses.
+// ============================================================
+
+export function buildMacroOutlook(signalIndex, spyGex, qqqGex, top5 = []) {
+  const regime    = signalIndex?.regime    || 'UNKNOWN';
+  const idxScore  = signalIndex?.score     ?? '—';
+  const sentiment = signalIndex?.sentiment ?? null;
+  const color     = REGIME_COLOR[regime]   ?? gexRegimeColor(spyGex);
+
+  // Morning vs evening framing for the two 12-hour-apart posts.
+  const hourET = Number(new Date().toLocaleString('en-US', {
+    timeZone: 'America/New_York', hour: '2-digit', hour12: false
+  }));
+  const session = (hourET >= 4 && hourET < 12) ? '🌅 Morning' : '🌙 Evening';
+
+  const regimeBadge = regime === 'RISK_ON'      ? '🟢 RISK_ON'
+                    : regime === 'RISK_OFF'     ? '🔴 RISK_OFF'
+                    : regime === 'TRANSITIONAL' ? '🟡 TRANSITIONAL'
+                    : '⚪ UNKNOWN';
+
+  const descLines = [
+    `**Regime:** ${regimeBadge}  ·  **Signal Index:** \`${idxScore}/100\`${sentiment ? `  ·  _(${sentiment})_` : ''}`,
+    `**Market gamma:** SPY ${gexRegimeLabel(spyGex, 'short')}  ·  QQQ ${gexRegimeLabel(qqqGex, 'short')}`
+  ];
+
+  const bullCount = signalIndex?.bullish_count ?? null;
+  const bearCount = signalIndex?.bearish_count ?? null;
+  const total     = signalIndex?.total_signals ?? null;
+  if (total != null) {
+    descLines.push(`**Breadth:** ${total} signals  ·  📈 ${bullCount ?? '—'} bull  ·  📉 ${bearCount ?? '—'} bear`);
+  }
+
+  const fields = [];
+  const top = (top5 || []).filter(r => r?.signal).slice(0, 5);
+  if (top.length > 0) {
+    const lines = top.map((r, i) => {
+      const signa  = r.signal?.signa || {};
+      const action = String(signa.action || '').toUpperCase();
+      const grade  = String(signa.grade  || '?').toUpperCase();
+      const score  = Math.round(signaScore(r.signal));
+      const dEmoji = leanEmoji(action);
+      const why    = topDriver(r.signal);
+      return `**${i + 1}.** ${dEmoji} **${r.ticker}** \`${score}\` · ${grade}${why ? ` · _${trunc(why, 50)}_` : ''}`;
+    });
+    fields.push({ name: '🎯 Watchlist — Top 5 by Score', value: lines.join('\n'), inline: false });
+  } else {
+    fields.push({ name: '🎯 Watchlist — Top 5 by Score', value: '_No ranked names available this run._', inline: false });
+  }
+
+  const embed = {
+    title: `${session} Outlook — ${todayStr()}`,
+    description: descLines.join('\n'),
+    color,
+    fields,
     footer: FOOTER,
     timestamp: new Date().toISOString()
   };

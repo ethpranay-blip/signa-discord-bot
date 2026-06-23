@@ -21,6 +21,7 @@ import {
   getSignal,
   getGex,
   isGexPlausible,
+  deriveGexRegime,
   getQuote,
   scan,
   screenTickers
@@ -37,7 +38,9 @@ import {
   buildRegimeUpdate,
   buildFlowHighlight,
   buildNightlySummary,
-  buildRegimeOutlook
+  buildRegimeOutlook,
+  buildMacroOutlook,
+  rankResults
 } from './formatter.js';
 
 import { startDiscordBot } from './discord-bot.js';
@@ -104,6 +107,7 @@ const state = {
 };
 
 let haltPolling = false; // set true on 401; cleared on process restart
+let DRY_RUN = false;     // set by --dry-run modifier on action flags; previews posts instead of sending
 
 // ============================================================
 // Logging
@@ -137,13 +141,32 @@ function formatPlan(plan) {
 // Discord poster — handles 429, enforces 1s/webhook spacing
 // ============================================================
 
-async function postToDiscord(webhookUrl, payload, jobLabel = 'job') {
-  if (!webhookUrl) {
-    logErr(`❌ ${jobLabel}: webhook URL missing`);
-    return false;
+// In DRY_RUN, print a readable preview of an embed payload instead of POSTing.
+function logPayloadPreview(payload, jobLabel) {
+  const embeds = payload.embeds || [];
+  log(`📝 [DRY] ${jobLabel}: would post ${embeds.length} embed(s)${payload.content ? ' + content' : ''}`);
+  for (const e of embeds) {
+    if (e.title) console.log(`      ┌─ ${e.title}`);
+    if (e.description) for (const ln of String(e.description).split('\n')) console.log(`      │ ${ln}`);
+    for (const f of (e.fields || [])) {
+      console.log(`      ├─ ${f.name}`);
+      for (const ln of String(f.value).split('\n')) console.log(`      │   ${ln}`);
+    }
+    console.log('      └─');
   }
+}
+
+async function postToDiscord(webhookUrl, payload, jobLabel = 'job') {
   if (!payload || (!payload.content && (!payload.embeds || payload.embeds.length === 0))) {
     log(`⏭️  ${jobLabel}: empty payload, skipping`);
+    return false;
+  }
+  if (DRY_RUN) {
+    logPayloadPreview(payload, jobLabel);
+    return true;
+  }
+  if (!webhookUrl) {
+    logErr(`❌ ${jobLabel}: webhook URL missing`);
     return false;
   }
 
@@ -238,7 +261,7 @@ function scheduleSignalIndexRetry(reason) {
 // computeVerdict — 6-gate filter (brief §3)
 // ============================================================
 
-function computeVerdict(signalData, spyGex) {
+function computeVerdict(signalData, tickerGex) {
   const signa  = signalData?.signa  || {};
   const data   = signalData?.data   || {};
   const engine = signalData?.engine || {};
@@ -255,17 +278,23 @@ function computeVerdict(signalData, spyGex) {
   const gate3 = ['LONG', 'SHORT'].includes(intendedDir);
   const gate4 = Number(signa.flowScore ?? 0) > 65;
 
-  // Gate 5 — regime alignment. Callers pass null for spyGex when the
-  // upstream read failed the plausibility check; in that case we record
-  // 'unavailable' (a non-boolean) so the card renders ⚠️ instead of ❌
-  // and the verdict can never reach CALL (CALL requires gate5 === true).
+  // Gate 5 — regime alignment, judged against THIS ticker's own GEX (tickerGex),
+  // not the index's. Regime is derived deterministically from the snapshot's own
+  // spot vs flip (see deriveGexRegime) so the gate can't flicker between calls.
+  //   • null     → 'unavailable' (GEX missing or failed the plausibility check):
+  //                renders ⚠️, can never reach CALL.
+  //   • AT_FLIP  → 'neutral': price sits at the flip, regime is ambiguous — also
+  //                ⚠️ and blocks CALL, but distinct from a confident disagreement.
+  //   • ABOVE/BELOW → boolean agreement with the intended direction.
   let gate5;
-  if (!spyGex || !spyGex.levels || typeof spyGex.levels.regimeAboveFlip !== 'boolean') {
+  const regime = deriveGexRegime(tickerGex);
+  if (regime === null) {
     gate5 = 'unavailable';
+  } else if (regime === 'AT_FLIP') {
+    gate5 = 'neutral';
   } else {
-    const regimeAbove = spyGex.levels.regimeAboveFlip;
-    gate5 = (intendedDir === 'LONG'  && regimeAbove === true)
-         || (intendedDir === 'SHORT' && regimeAbove === false);
+    gate5 = (intendedDir === 'LONG'  && regime === 'ABOVE')
+         || (intendedDir === 'SHORT' && regime === 'BELOW');
   }
 
   const gate6 = data.stop != null && data.target != null;
@@ -351,44 +380,52 @@ async function runHourlyScan() {
 
   if (!(await checkQuota())) return;
 
-  // 1. Sweep watchlist — 1500ms stagger between calls
+  // 1. Sweep watchlist — for each ticker fetch its signal AND its OWN GEX, so
+  //    gate 5 judges every name against its own gamma flip/walls (not the
+  //    index's). 1500ms stagger between tickers; signal+GEX run together per
+  //    ticker so a GEX failure never discards the signal (allSettled).
   const sweepResults = [];
+  const gexBySymbol = new Map();
   for (let i = 0; i < WATCHLIST.length; i++) {
     const ticker = WATCHLIST[i];
-    try {
-      const sig = await getSignal(ticker);
-      sweepResults.push({ ticker, signal: sig, error: null });
-    } catch (err) {
-      sweepResults.push({ ticker, signal: null, error: err.message });
-      logErr(`  signal failed for ${ticker}: ${err.message}`);
-    }
+    const [sigRes, gexRes] = await Promise.allSettled([getSignal(ticker), getGex(ticker)]);
+    const sig    = sigRes.status === 'fulfilled' ? sigRes.value : null;
+    const gexRaw = gexRes.status === 'fulfilled' ? gexRes.value : null;
+    if (sigRes.status === 'rejected') logErr(`  signal failed for ${ticker}: ${sigRes.reason?.message}`);
+    if (gexRes.status === 'rejected') logErr(`  GEX failed for ${ticker}: ${gexRes.reason?.message}`);
+    sweepResults.push({ ticker, signal: sig, error: sigRes.status === 'rejected' ? sigRes.reason?.message : null });
+    gexBySymbol.set(ticker, sanitizeGex(gexRaw, ticker));
     if (i < WATCHLIST.length - 1) await new Promise(r => setTimeout(r, 1500));
   }
 
-  // 2. GEX — SPY primary, QQQ confirmation
-  const [spyRes, qqqRes] = await Promise.allSettled([getGex('SPY'), getGex('QQQ')]);
-  const spyRaw = spyRes.status === 'fulfilled' ? spyRes.value : null;
-  const qqqRaw = qqqRes.status === 'fulfilled' ? qqqRes.value : null;
-  if (!spyRaw) logErr(`  ⚠️  GEX/SPY failed: ${spyRes.reason?.message}`);
-  const spyGex = sanitizeGex(spyRaw, 'SPY');
-  const qqqGex = sanitizeGex(qqqRaw, 'QQQ');
+  // 2. Market-level GEX for the #macro regime card — deliberately SPY/QQQ
+  //    (the index-wide regime context), kept separate from the per-ticker
+  //    gate-5 evaluation above. Reuse the sweep's GEX if SPY/QQQ are on the
+  //    watchlist (the common case); otherwise fetch them explicitly.
+  const spyGex = gexBySymbol.has('SPY')
+    ? gexBySymbol.get('SPY')
+    : sanitizeGex(await getGex('SPY').catch(e => { logErr(`  ⚠️  GEX/SPY failed: ${e.message}`); return null; }), 'SPY');
+  const qqqGex = gexBySymbol.has('QQQ')
+    ? gexBySymbol.get('QQQ')
+    : sanitizeGex(await getGex('QQQ').catch(e => { logErr(`  ⚠️  GEX/QQQ failed: ${e.message}`); return null; }), 'QQQ');
 
-  // 3. Compute verdicts
+  // 3. Compute verdicts — each ticker against its OWN GEX
   const allResults = [];
   for (const r of sweepResults) {
     if (!r.signal) continue;
-    const verdict = computeVerdict(r.signal, spyGex);
-    allResults.push({ ticker: r.ticker, signal: r.signal, verdict });
+    const gex = gexBySymbol.get(r.ticker) ?? null;
+    const verdict = computeVerdict(r.signal, gex);
+    allResults.push({ ticker: r.ticker, signal: r.signal, verdict, gex });
   }
 
   // Cache for nightly summary
   state.lastCycleResults = allResults;
   state.lastCycleTime    = new Date().toISOString();
 
-  // 4. CALL verdicts → #signals
+  // 4. CALL verdicts → #signals (card shows the ticker's OWN GEX)
   const callResults = allResults.filter(r => r.verdict.verdict === 'CALL');
   for (const r of callResults) {
-    const card = buildCallCard(r.ticker, r.signal, spyGex, r.verdict);
+    const card = buildCallCard(r.ticker, r.signal, r.gex, r.verdict);
     if (card) await postToDiscord(route('signals'), card, `hourly-call-${r.ticker}`);
   }
 
@@ -398,16 +435,16 @@ async function runHourlyScan() {
     if (grid) await postToDiscord(route('micro'), grid, 'hourly-grid');
   }
 
-  // 6. GEX regime → #macro on flip
-  if (spyGex?.levels) {
-    const regimeAbove  = spyGex.levels.regimeAboveFlip;
-    const newGexRegime = regimeAbove === true ? 'ABOVE_FLIP' : regimeAbove === false ? 'BELOW_FLIP' : null;
-    if (newGexRegime && newGexRegime !== state.lastGexRegime) {
-      log(`  GEX regime flip: ${state.lastGexRegime ?? 'none'} → ${newGexRegime}`);
-      const regimeMsg = buildRegimeUpdate(spyGex, qqqGex);
-      if (regimeMsg) await postToDiscord(route('macro'), regimeMsg, 'hourly-regime-flip');
-      state.lastGexRegime = newGexRegime;
-    }
+  // 6. GEX regime → #macro on flip. Derived deterministically (spot vs flip
+  //    with a neutral band) so price hovering at the flip doesn't spam #macro
+  //    with phantom flips. AT_FLIP/unknown is treated as "no change".
+  const spyRegime = deriveGexRegime(spyGex); // 'ABOVE' | 'BELOW' | 'AT_FLIP' | null
+  const newGexRegime = spyRegime === 'ABOVE' ? 'ABOVE_FLIP' : spyRegime === 'BELOW' ? 'BELOW_FLIP' : null;
+  if (newGexRegime && newGexRegime !== state.lastGexRegime) {
+    log(`  GEX regime flip: ${state.lastGexRegime ?? 'none'} → ${newGexRegime}`);
+    const regimeMsg = buildRegimeUpdate(spyGex, qqqGex);
+    if (regimeMsg) await postToDiscord(route('macro'), regimeMsg, 'hourly-regime-flip');
+    state.lastGexRegime = newGexRegime;
   }
 
   // 7. Flow highlights → #darkpool (flowScore > 75)
@@ -509,6 +546,62 @@ async function runPremarketBrief() {
     }
   } catch (err) {
     logErr(`❌ premarket-brief failed: ${err.message}`);
+  }
+}
+
+// ============================================================
+// JOB 4 — Macro outlook (twice daily, 12h apart: ~09:15 & ~21:15 ET)
+// The day's outlook for #macro: overall regime + SPY/QQQ market-level
+// gamma context + the top-5 tradeable names by Signa score (same ranking
+// as the #micro feed). Pass { dryRun: true } to preview without posting.
+// ============================================================
+
+async function runMacroOutlook({ dryRun = false } = {}) {
+  const prevDry = DRY_RUN;
+  if (dryRun) DRY_RUN = true;
+  log('───────────────────────────────────');
+  log('🗓️  Running macro outlook…');
+  const t0 = Date.now();
+  try {
+    if (haltPolling) { log('⛔ Macro outlook skipped — polling halted (401).'); return; }
+    if (!(await checkQuota())) return;
+
+    // Sweep the watchlist for current signals (ranking uses signa.conviction;
+    // per-ticker GEX is not needed here — market gamma context is SPY/QQQ).
+    const sigs = [];
+    for (let i = 0; i < WATCHLIST.length; i++) {
+      const ticker = WATCHLIST[i];
+      try {
+        sigs.push({ ticker, signal: await getSignal(ticker) });
+      } catch (err) {
+        logErr(`  signal failed for ${ticker}: ${err.message}`);
+      }
+      if (i < WATCHLIST.length - 1) await new Promise(r => setTimeout(r, 1500));
+    }
+
+    // Market-level context: signal-index regime + SPY/QQQ gamma.
+    const [idxRes, spyRes, qqqRes] = await Promise.allSettled([
+      getSignalIndex(), getGex('SPY'), getGex('QQQ')
+    ]);
+    const signalIndex = idxRes.status === 'fulfilled' ? idxRes.value : null;
+    const spyGex = sanitizeGex(spyRes.status === 'fulfilled' ? spyRes.value : null, 'SPY');
+    const qqqGex = sanitizeGex(qqqRes.status === 'fulfilled' ? qqqRes.value : null, 'QQQ');
+    if (idxRes.status === 'rejected') {
+      logErr(`  ⚠️  signal-index failed: ${idxRes.reason?.message}`);
+      scheduleSignalIndexRetry(idxRes.reason);
+    }
+
+    const top5 = rankResults(sigs).slice(0, 5);
+    log(`  Top 5: ${top5.map(r => `${r.ticker}(${Math.round(Number(r.signal?.signa?.conviction ?? 0))})`).join(', ') || '—'}`);
+
+    const outlook = buildMacroOutlook(signalIndex, spyGex, qqqGex, top5);
+    if (outlook) await postToDiscord(route('macro'), outlook, 'macro-outlook');
+
+    const ms = Date.now() - t0;
+    log(`✓ Macro outlook complete in ${ms}ms — regime ${signalIndex?.regime || 'UNKNOWN'}, ${top5.length} top names`);
+  } finally {
+    DRY_RUN = prevDry;
+    log('───────────────────────────────────');
   }
 }
 
@@ -641,7 +734,7 @@ async function startup() {
   }
   log('');
   log('Rate limit: 60 req/hr · 1,000/day (Founding plan)');
-  log(`Hourly scan: ${WATCHLIST.length} tickers + 2 GEX + 1 quota = ~${WATCHLIST.length + 3} calls/hr`);
+  log(`Hourly scan: ${WATCHLIST.length} signals + ${WATCHLIST.length} GEX (per-ticker) + 1 quota ≈ ${WATCHLIST.length * 2 + 1} calls/hr`);
   log('');
   log('Scheduled jobs (America/New_York, weekdays):');
   log('  🔁 Hourly scan          :00 every hour     Mon–Fri    → #signals (CALLs) · #micro (grid) · #macro (regime flip) · #darkpool (flow)');
@@ -649,6 +742,7 @@ async function startup() {
     log('  🌅 Pre-market brief    09:00 ET           Mon–Fri    → #macro (GEX) · #signals (screener)');
   }
   log(`  📊 Nightly digest      ${fmtCron(DIGEST_MINUTE, DIGEST_HOUR)}  Mon–Fri    → #macro (outlook) · #signals (CALL summary)`);
+  log('  🗓️  Macro outlook       09:15 & 21:15 ET  Mon–Fri    → #macro (regime + top-5 watchlist, 12h cadence)');
   log('');
   log('Disabled (undocumented endpoints on Founding plan):');
   log('  🌊 Dark pool sweep     (flow data via signa.flowScore in hourly scan → #darkpool)');
@@ -664,6 +758,12 @@ async function startup() {
   }
 
   cron.schedule(`${DIGEST_MINUTE} ${DIGEST_HOUR} * * 1-5`, runNightlyDigest, { timezone: TZ });
+
+  // Macro outlook — twice daily, 12h apart. timezone:TZ resolves these to the
+  // correct ET moment year-round (node-cron applies DST), so no hardcoded UTC
+  // offset is needed.  09:15 ET = ~15 min before the 09:30 open · 21:15 ET = +12h.
+  cron.schedule('15 9 * * 1-5',  () => runMacroOutlook(), { timezone: TZ });
+  cron.schedule('15 21 * * 1-5', () => runMacroOutlook(), { timezone: TZ });
 
   // Startup notice to Discord
   const nextDigest = `${fmtCron(DIGEST_MINUTE, DIGEST_HOUR)} (Mon–Fri)`;
@@ -699,22 +799,30 @@ process.on('uncaughtException', (err) => {
 
 // ============================================================
 // CLI flags
-//   node bot.js --dry-run [TICKER]   → fetch signal + SPY GEX, compute verdict, log only
-//   node bot.js --post-test TICKER   → fetch signal + SPY GEX, build call card,
+//   node bot.js --dry-run [TICKER]   → fetch signal + that ticker's GEX, compute verdict, log only
+//   node bot.js --post-test TICKER   → fetch signal + that ticker's GEX, build call card,
 //                                       POST only to DISCORD_TEST_WEBHOOK_URL, exit
 //   node bot.js --run-hourly-now     → run one hourly scan cycle and exit
 //   node bot.js --digest-now         → run nightly digest and exit
 //   node bot.js --premarket-now      → run pre-market brief and exit
+//   node bot.js --post-macro-now     → run the macro outlook once → #macro and exit
+//
+//   Add --dry-run to any action flag above to PREVIEW (build payloads, log them,
+//   send nothing to Discord), e.g. `node bot.js --run-hourly-now --dry-run`.
 // ============================================================
 
 const cliArgs = process.argv.slice(2);
+const dryRun  = cliArgs.includes('--dry-run');
+const ACTION_FLAGS = ['--post-test', '--run-hourly-now', '--digest-now', '--premarket-now', '--post-macro-now', '--backtest'];
+const hasAction = ACTION_FLAGS.some(f => cliArgs.includes(f));
 
-async function runOneShot(label, fn) {
-  console.log(`\n[${ts()}] One-shot: ${label}\n`);
+async function runOneShot(label, fn, dry = false) {
+  console.log(`\n[${ts()}] One-shot: ${label}${dry ? '  [DRY-RUN — no Discord posts]' : ''}\n`);
   validateEnv();
+  if (dry) DRY_RUN = true;
   try {
     await fn();
-    console.log(`\n[${ts()}] ✓ ${label} complete. Check Discord.\n`);
+    console.log(`\n[${ts()}] ✓ ${label} complete.${dry ? ' (dry-run — nothing posted)' : ' Check Discord.'}\n`);
     process.exit(0);
   } catch (err) {
     console.error(`\n[${ts()}] ❌ ${label} failed: ${err.message}\n`);
@@ -722,35 +830,43 @@ async function runOneShot(label, fn) {
   }
 }
 
-if (cliArgs.includes('--dry-run')) {
-  // Fetch signal + GEX, compute verdict, log to console — no Discord post
+if (cliArgs.includes('--dry-run') && !hasAction) {
+  // Bare --dry-run [TICKER]: fetch signal + that ticker's GEX, compute verdict,
+  // log to console — no Discord post. (With an action flag, --dry-run instead
+  // acts as a preview modifier on that action, handled below.)
   validateEnv();
   const dryIdx    = cliArgs.indexOf('--dry-run');
   const testTicker = (cliArgs[dryIdx + 1] && !cliArgs[dryIdx + 1].startsWith('--'))
     ? cliArgs[dryIdx + 1].toUpperCase()
     : 'NVDA';
-  console.log(`\n[${ts()}] Dry run — fetching ${testTicker} signal + SPY GEX…\n`);
+  console.log(`\n[${ts()}] Dry run — fetching ${testTicker} signal + ${testTicker} GEX…\n`);
   (async () => {
     try {
-      const [sig, spyRaw] = await Promise.all([getSignal(testTicker), getGex('SPY')]);
-      const spyGex = sanitizeGex(spyRaw, 'SPY');
-      const verdict = computeVerdict(sig, spyGex);
+      const [sig, gexRaw] = await Promise.all([getSignal(testTicker), getGex(testTicker)]);
+      const gex = sanitizeGex(gexRaw, testTicker);
+      const verdict = computeVerdict(sig, gex);
 
       console.log(`\n=== ${testTicker} — signa surface ===`);
       console.log(JSON.stringify(sig?.signa || sig, null, 2).slice(0, 1200));
       console.log(`\n=== ${testTicker} — data surface ===`);
       console.log(JSON.stringify(sig?.data || {}, null, 2).slice(0, 600));
-      console.log('\n=== SPY GEX levels ===');
-      console.log(spyGex
-        ? JSON.stringify(spyGex?.levels || spyGex, null, 2).slice(0, 600)
-        : `(unavailable — raw: ${JSON.stringify(spyRaw?.levels || spyRaw, null, 2).slice(0, 300)})`);
+      console.log(`\n=== ${testTicker} GEX levels ===`);
+      console.log(gex
+        ? JSON.stringify(gex?.levels || gex, null, 2).slice(0, 600)
+        : `(unavailable — raw: ${JSON.stringify(gexRaw?.levels || gexRaw, null, 2).slice(0, 300)})`);
+      const spot = gex?.underlying?.price;
+      const flip = gex?.levels?.gammaFlipLevel ?? gex?.levels?.flipLevel;
+      const regime = deriveGexRegime(gex);
+      console.log(`\n=== ${testTicker} regime (deterministic) ===`);
+      console.log(`spot=${spot ?? '—'}  flip=${flip ?? '—'}  →  regimeAboveFlip(raw)=${gex?.levels?.regimeAboveFlip ?? '—'}  derived=${regime ?? 'unavailable'}`);
       console.log('\n=== Verdict ===');
       console.log(`VERDICT: ${verdict.verdict}`);
       for (let i = 1; i <= 6; i++) {
         const g = `gate${i}`;
         const v = verdict.gates[g];
-        const mark = v === true ? '✅' : v === 'unavailable' ? '⚠️ ' : '❌';
-        console.log(`  ${mark} ${g}${v === 'unavailable' ? ' (unavailable)' : ''}`);
+        const soft = v === 'unavailable' || v === 'neutral';
+        const mark = v === true ? '✅' : soft ? '⚠️ ' : '❌';
+        console.log(`  ${mark} ${g}${soft ? ` (${v})` : ''}`);
       }
       console.log('\n✓ Dry run complete — no Discord posts made.\n');
       process.exit(0);
@@ -781,11 +897,11 @@ if (cliArgs.includes('--dry-run')) {
   console.log(`\n[${ts()}] Post-test — ${testTicker} → DISCORD_TEST_WEBHOOK_URL\n`);
   (async () => {
     try {
-      const [sig, spyRaw] = await Promise.all([getSignal(testTicker), getGex('SPY')]);
-      const spyGex = sanitizeGex(spyRaw, 'SPY');
-      const verdict = computeVerdict(sig, spyGex);
+      const [sig, gexRaw] = await Promise.all([getSignal(testTicker), getGex(testTicker)]);
+      const gex = sanitizeGex(gexRaw, testTicker);
+      const verdict = computeVerdict(sig, gex);
       console.log(`Verdict: ${verdict.verdict}  (gate5=${verdict.gates.gate5})`);
-      const card = buildCallCard(testTicker, sig, spyGex, verdict, { isPreview: true });
+      const card = buildCallCard(testTicker, sig, gex, verdict, { isPreview: true });
       if (!card) {
         console.error('\n❌ buildCallCard returned empty payload — nothing to post.\n');
         process.exit(1);
@@ -803,11 +919,25 @@ if (cliArgs.includes('--dry-run')) {
     }
   })();
 } else if (cliArgs.includes('--run-hourly-now')) {
-  runOneShot('Hourly scan', runHourlyScan);
+  runOneShot('Hourly scan', runHourlyScan, dryRun);
 } else if (cliArgs.includes('--digest-now')) {
-  runOneShot('Nightly digest', runNightlyDigest);
+  runOneShot('Nightly digest', runNightlyDigest, dryRun);
 } else if (cliArgs.includes('--premarket-now')) {
-  runOneShot('Pre-market brief', runPremarketBrief);
+  runOneShot('Pre-market brief', runPremarketBrief, dryRun);
+} else if (cliArgs.includes('--post-macro-now')) {
+  // Build the macro outlook and post it to #macro (or preview with --dry-run).
+  validateEnv();
+  console.log(`\n[${ts()}] Macro outlook${dryRun ? '  [DRY-RUN — no Discord posts]' : ' → #macro'}\n`);
+  (async () => {
+    try {
+      await runMacroOutlook({ dryRun });
+      console.log(`\n[${ts()}] ✓ Macro outlook complete.${dryRun ? ' (dry-run — nothing posted)' : ' Check #macro.'}\n`);
+      process.exit(0);
+    } catch (err) {
+      console.error(`\n[${ts()}] ❌ Macro outlook failed: ${err.message}\n`);
+      process.exit(1);
+    }
+  })();
 } else if (cliArgs.includes('--backtest')) {
   console.error('\n❌ Backtest is not available on the Founding plan.');
   console.error('   POST /api/v1/backtest is an undocumented endpoint not included in Founding tier.\n');
@@ -819,7 +949,8 @@ if (cliArgs.includes('--dry-run')) {
   if (unknownFlag) {
     console.error(`\n❌ Unknown CLI flag: ${unknownFlag}`);
     console.error('   Known flags: --dry-run [TICKER], --post-test TICKER, --run-hourly-now,');
-    console.error('                --digest-now, --premarket-now, --backtest\n');
+    console.error('                --digest-now, --premarket-now, --post-macro-now, --backtest');
+    console.error('   Tip: add --dry-run to any action flag to preview without posting.\n');
     process.exit(1);
   }
   // Normal run — start scheduled bot
