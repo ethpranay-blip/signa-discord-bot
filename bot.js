@@ -44,6 +44,12 @@ import {
 
 import { startDiscordBot } from './discord-bot.js';
 
+// Signa-driven channel handlers (Phase 2). Gated by SIGNA_CHANNELS_ENABLED.
+// These are additive and do not touch the existing #shardi-setup hourly scan.
+import { runSignalsCycle } from './lib/channels/signals-handler.js';
+import { runMicroCycle } from './lib/channels/micro-handler.js';
+import { runMacroCycle } from './lib/channels/macro-handler.js';
+
 // ---- Paper-validation track logging (measurement only; no behavior change) ----
 // Appends one JSON line per CALL + one cycle-summary line per hourly scan to
 // TRACK_LOG_PATH. Feeds the offline ingest → signa_tracker.xlsx. File writes only.
@@ -81,6 +87,12 @@ const WATCHLIST = (process.env.WATCHLIST || '')
 const DIGEST_HOUR   = parseInt(process.env.DIGEST_HOUR   || '21', 10);
 const DIGEST_MINUTE = parseInt(process.env.DIGEST_MINUTE || '30', 10);
 const ENABLE_PREMARKET = (process.env.ENABLE_PREMARKET || 'true').toLowerCase() === 'true';
+
+// Phase 2 master switch for the Signa-driven channels (#signals/#micro/#macro).
+// Default OFF: crons still register and run the full pipeline, but cards print
+// to stdout instead of posting to Discord, and NO JSONL track rows are written.
+// Set SIGNA_CHANNELS_ENABLED=true to take the new channels live.
+const SIGNA_CHANNELS_ENABLED = (process.env.SIGNA_CHANNELS_ENABLED || 'false').toLowerCase() === 'true';
 
 const TZ = 'America/New_York';
 
@@ -236,6 +248,24 @@ async function postToDiscord(webhookUrl, payload, jobLabel = 'job') {
     return false;
   }
   return false;
+}
+
+// ============================================================
+// Signa-driven channel context (Phase 2)
+// Dependency bundle injected into the channel handlers so they never import
+// bot.js (avoids a circular import). When channelsEnabled is false the engine
+// previews cards to stdout and writes no JSONL.
+// ============================================================
+function channelCtx({ forcePreview = false } = {}) {
+  return {
+    scan,
+    getSignal,
+    post: (channel, embed, label) => postToDiscord(route(channel), { embeds: [embed] }, label),
+    track: logTrack,
+    log,
+    checkQuota,
+    channelsEnabled: SIGNA_CHANNELS_ENABLED && !forcePreview,
+  };
 }
 
 // Detect 503/nightly_pipeline_pending from a getSignalIndex() rejection.
@@ -851,6 +881,27 @@ async function startup() {
   cron.schedule('15 9 * * 1-5',  () => runMacroOutlook(), { timezone: TZ });
   cron.schedule('15 21 * * 1-5', () => runMacroOutlook(), { timezone: TZ });
 
+  // ---- Signa-driven channels (Phase 2.5) --------------------------------
+  // Crons ALWAYS register; SIGNA_CHANNELS_ENABLED only gates the post/log step
+  // (see channelCtx). No /scan — each cycle enriches its full universe via
+  // /api/v1/signal through a shared 30-min cache, filters, ranks by conviction,
+  // posts top 5. #signals :02 / #micro :30 are constrained to US market hours
+  // (9-16 ET) to bound call volume; #macro twice daily 09:15/21:15.
+  //
+  // Rate budget (Founding: 60/min, 1000/day):
+  //   Worst case (cache fully cold every cycle):
+  //     #signals 8×50 + #micro 8×50 + #macro 2×22 = ~844 channel calls/day
+  //     + ~307 existing #shardi-setup/etc ≈ ~1150/day → WOULD EXCEED quota.
+  //   Expected (micro reuses signals' cached 50 within the 30-min TTL):
+  //     ~8×50 + ~2×22 = ~444 channel calls/day + ~307 ≈ ~751/day → comfortable.
+  //   The conviction≥65 filter also skips many cycles entirely (empty → no post),
+  //   so real-world load is lower still. Per cycle is quota-gated (checkQuota).
+  log(`  📡 Signa channels       :02 / :30 (9-16 ET) · 09:15 & 21:15 ET   → #signals · #micro · #macro  [${SIGNA_CHANNELS_ENABLED ? 'LIVE' : 'DRY: stdout only, no JSONL'}]`);
+  cron.schedule('2 9-16 * * 1-5',  () => runSignalsCycle(channelCtx()).catch(e => logErr(`#signals cycle failed: ${e.message}`)), { timezone: TZ });
+  cron.schedule('30 9-16 * * 1-5', () => runMicroCycle(channelCtx()).catch(e => logErr(`#micro cycle failed: ${e.message}`)), { timezone: TZ });
+  cron.schedule('15 9 * * 1-5',  () => runMacroCycle(channelCtx()).catch(e => logErr(`#macro cycle failed: ${e.message}`)), { timezone: TZ });
+  cron.schedule('15 21 * * 1-5', () => runMacroCycle(channelCtx()).catch(e => logErr(`#macro cycle failed: ${e.message}`)), { timezone: TZ });
+
   // Startup notice to Discord
   const nextDigest = `${fmtCron(DIGEST_MINUTE, DIGEST_HOUR)} (Mon–Fri)`;
   const startupPayload = buildStartupNotice(me, nextDigest, WATCHLIST.length);
@@ -899,7 +950,8 @@ process.on('uncaughtException', (err) => {
 
 const cliArgs = process.argv.slice(2);
 const dryRun  = cliArgs.includes('--dry-run');
-const ACTION_FLAGS = ['--post-test', '--run-hourly-now', '--digest-now', '--premarket-now', '--post-macro-now', '--backtest'];
+const ACTION_FLAGS = ['--post-test', '--run-hourly-now', '--digest-now', '--premarket-now', '--post-macro-now', '--backtest',
+  '--post-signals-channel-now', '--post-micro-channel-now', '--post-macro-channel-now'];
 const hasAction = ACTION_FLAGS.some(f => cliArgs.includes(f));
 
 async function runOneShot(label, fn, dry = false) {
@@ -912,6 +964,24 @@ async function runOneShot(label, fn, dry = false) {
     process.exit(0);
   } catch (err) {
     console.error(`\n[${ts()}] ❌ ${label} failed: ${err.message}\n`);
+    process.exit(1);
+  }
+}
+
+// One-shot runner for a Signa-driven channel cycle. With --dry-run (or while
+// SIGNA_CHANNELS_ENABLED is false) it previews cards to stdout and writes no JSONL.
+async function runChannelOneShot(channel, cycleFn, dry = false) {
+  const mode = dry
+    ? 'DRY-RUN — stdout only, no JSONL'
+    : (SIGNA_CHANNELS_ENABLED ? 'LIVE — posts to Discord + JSONL' : 'channels disabled — stdout only, no JSONL');
+  console.log(`\n[${ts()}] One-shot: #${channel} cycle  [${mode}]\n`);
+  validateEnv();
+  try {
+    await cycleFn(channelCtx({ forcePreview: dry }));
+    console.log(`\n[${ts()}] ✓ #${channel} cycle complete.\n`);
+    process.exit(0);
+  } catch (err) {
+    console.error(`\n[${ts()}] ❌ #${channel} cycle failed: ${err.message}\n`);
     process.exit(1);
   }
 }
@@ -1024,6 +1094,14 @@ if (cliArgs.includes('--dry-run') && !hasAction) {
       process.exit(1);
     }
   })();
+} else if (cliArgs.includes('--post-signals-channel-now')) {
+  runChannelOneShot('signals', runSignalsCycle, dryRun);
+} else if (cliArgs.includes('--post-micro-channel-now')) {
+  runChannelOneShot('micro', runMicroCycle, dryRun);
+} else if (cliArgs.includes('--post-macro-channel-now')) {
+  // NOTE: --post-macro-now is already taken by the existing macro OUTLOOK.
+  // This flag drives the new Phase 2.5 #macro channel cycle.
+  runChannelOneShot('macro', runMacroCycle, dryRun);
 } else if (cliArgs.includes('--backtest')) {
   console.error('\n❌ Backtest is not available on the Founding plan.');
   console.error('   POST /api/v1/backtest is an undocumented endpoint not included in Founding tier.\n');
@@ -1035,7 +1113,8 @@ if (cliArgs.includes('--dry-run') && !hasAction) {
   if (unknownFlag) {
     console.error(`\n❌ Unknown CLI flag: ${unknownFlag}`);
     console.error('   Known flags: --dry-run [TICKER], --post-test TICKER, --run-hourly-now,');
-    console.error('                --digest-now, --premarket-now, --post-macro-now, --backtest');
+    console.error('                --digest-now, --premarket-now, --post-macro-now, --backtest,');
+    console.error('                --post-signals-channel-now, --post-micro-channel-now, --post-macro-channel-now');
     console.error('   Tip: add --dry-run to any action flag to preview without posting.\n');
     process.exit(1);
   }
