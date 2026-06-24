@@ -44,6 +44,31 @@ import {
 
 import { startDiscordBot } from './discord-bot.js';
 
+// ---- Paper-validation track logging (measurement only; no behavior change) ----
+// Appends one JSON line per CALL + one cycle-summary line per hourly scan to
+// TRACK_LOG_PATH. Feeds the offline ingest → signa_tracker.xlsx. File writes only.
+import { appendFile } from 'node:fs/promises';
+
+const TRACK_LOG_PATH = process.env.TRACK_LOG_PATH || './signa_track.jsonl';
+
+async function logTrack(record) {
+  try {
+    await appendFile(TRACK_LOG_PATH, JSON.stringify(record) + '\n');
+  } catch (e) {
+    logErr(`📝 track-log write failed: ${e.message}`);
+  }
+}
+
+// Signed distance of spot from the gamma flip ((spot-flip)/flip) — same inputs
+// gate 5 uses, so the log matches the verdict.
+function gexDist(gex) {
+  const lv = gex?.levels || {};
+  const flip = Number(lv.gammaFlipLevel ?? lv.flipLevel);
+  const spot = Number(gex?.underlying?.price ?? gex?.underlying?.regularClose);
+  if (!Number.isFinite(flip) || flip <= 0 || !Number.isFinite(spot) || spot <= 0) return null;
+  return (spot - flip) / flip;
+}
+
 // --- Environment ---
 const SIGNA_API_KEY = process.env.SIGNA_API_KEY;
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
@@ -426,6 +451,71 @@ async function runHourlyScan() {
     const card = buildCallCard(r.ticker, r.signal, r.gex, r.verdict);
     if (card) await postToDiscord(route('signals'), card, `hourly-call-${r.ticker}`);
   }
+
+  // ===== PAPER-TRACK LOGGING (measurement layer — file writes only, no posts) =====
+  {
+    const nowEt = new Date().toLocaleString('en-US', { timeZone: TZ, hour12: false }) + ' ET';
+    const todayEt = new Date().toLocaleDateString('en-CA', { timeZone: TZ }); // YYYY-MM-DD
+
+    // Tally which gates failed across every evaluated name this cycle.
+    // gate5 is 'unavailable'/'neutral'/false unless true; all non-true = a fail.
+    const gateFails = { g1: 0, g2: 0, g3: 0, g4: 0, g5: 0, g6: 0 };
+    let cameClose = 0;
+    for (const r of allResults) {
+      const g = r.verdict.gates;
+      const fails = [];
+      if (g.gate1 !== true) fails.push('g1');
+      if (g.gate2 !== true) fails.push('g2');
+      if (g.gate3 !== true) fails.push('g3');
+      if (g.gate4 !== true) fails.push('g4');
+      if (g.gate5 !== true) fails.push('g5');
+      if (g.gate6 !== true) fails.push('g6');
+      for (const f of fails) gateFails[f]++;
+      if (fails.length === 1) cameClose++;   // "came close" = missed by exactly one gate
+    }
+
+    // One row per CALL.
+    for (const r of callResults) {
+      const s = r.signal?.signa || {};
+      const d = r.signal?.data || {};
+      await logTrack({
+        type: 'call',
+        call_id: `${state.lastCycleTime}-${r.ticker}-${String(s.action || '').toUpperCase()}`,
+        ts_et: nowEt,
+        ticker: r.ticker,
+        direction: String(s.action || '').toUpperCase(),
+        grade: String(s.grade || '').toUpperCase(),
+        conviction: s.conviction ?? null,
+        flow_score: s.flowScore ?? null,
+        risk_rating: s.riskRating ?? null,
+        regime_gex: deriveGexRegime(r.gex),          // ABOVE | BELOW | AT_FLIP | null
+        signa_regime: s.regimeClass ?? null,
+        gex_dist: gexDist(r.gex),
+        entry: d.entry ?? null,
+        stop: d.stop ?? null,
+        target: d.target ?? null,
+        rr_card: d.rr ?? null,
+        spot_at_call: r.gex?.underlying?.price ?? d.price ?? null,
+        triggers: Array.isArray(s.triggers)
+          ? s.triggers.map(t => (typeof t === 'string' ? t : t?.name)).filter(Boolean)
+          : []
+      });
+    }
+
+    // One summary row per hourly cycle (ingest groups these by date).
+    await logTrack({
+      type: 'cycle',
+      cycle_id: state.lastCycleTime,
+      ts_et: nowEt,
+      date: todayEt,
+      candidates_evaluated: WATCHLIST.length,
+      signals_returned: allResults.length,
+      calls_fired: callResults.length,
+      came_close: cameClose,
+      gate_fails: gateFails
+    });
+  }
+  // ===== END PAPER-TRACK LOGGING =====
 
   // 5. Watchlist grid → #micro
   if (allResults.length > 0) {
