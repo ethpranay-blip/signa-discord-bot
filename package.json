@@ -12,10 +12,11 @@
     "node": ">=18"
   },
   "dependencies": {
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5",
     "node-cron": "^3.0.3",
     "node-fetch": "^3.3.2",
-    "dotenv": "^16.4.5",
-    "discord.js": "^14.16.3"
+    "xlsx": "^0.18.5"
   },
   "overrides": {
     "undici": "^6.27.0"
