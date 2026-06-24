@@ -11,6 +11,9 @@ package-lock.json
 *.log
 npm-debug.log*
 
+# Paper-validation track log (local dev artifact; prod writes to /data Volume)
+signa_track.jsonl
+
 # OS
 .DS_Store
 Thumbs.db
