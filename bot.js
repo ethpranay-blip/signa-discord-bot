@@ -36,7 +36,6 @@ import {
   buildCallCard,
   buildWatchlistGrid,
   buildRegimeUpdate,
-  buildFlowHighlight,
   buildNightlySummary,
   buildRegimeOutlook,
   buildMacroOutlook,
@@ -71,7 +70,6 @@ const CHANNELS = {
   micro:    process.env.DISCORD_WEBHOOK_MICRO    || DISCORD_ALERTS_WEBHOOK_URL,
   macro:    process.env.DISCORD_WEBHOOK_MACRO    || DISCORD_WEBHOOK_URL,
   earnings: process.env.DISCORD_WEBHOOK_EARNINGS || DISCORD_WEBHOOK_URL,
-  darkpool: process.env.DISCORD_WEBHOOK_DARKPOOL || DISCORD_WEBHOOK_URL,
   fomc:     process.env.DISCORD_WEBHOOK_FOMC     || DISCORD_ALERTS_WEBHOOK_URL,
   lookups:  process.env.DISCORD_WEBHOOK_LOOKUPS  || DISCORD_WEBHOOK_URL,
   backtest: process.env.DISCORD_WEBHOOK_BACKTEST || DISCORD_WEBHOOK_URL
@@ -447,16 +445,13 @@ async function runHourlyScan() {
     state.lastGexRegime = newGexRegime;
   }
 
-  // 7. Flow highlights → #darkpool (flowScore > 75)
+  // 7. High-flow names — counted for the summary log only. Flow alerts to
+  //    #darkpool were removed (channel retired); no webhook publishing.
   const FLOW_ALERT_THRESHOLD = 75;
   const flowHits = allResults.filter(r => Number(r.signal?.signa?.flowScore ?? 0) > FLOW_ALERT_THRESHOLD);
-  for (const r of flowHits) {
-    const msg = buildFlowHighlight(r.ticker, r.signal);
-    if (msg) await postToDiscord(route('darkpool'), msg, `hourly-flow-${r.ticker}`);
-  }
 
   const ms = Date.now() - t0;
-  log(`✓ Hourly scan: ${WATCHLIST.length} tickers swept, ${allResults.length} signals, ${callResults.length} CALLs, ${flowHits.length} flow alerts — ${ms}ms`);
+  log(`✓ Hourly scan: ${WATCHLIST.length} tickers swept, ${allResults.length} signals, ${callResults.length} CALLs, ${flowHits.length} high-flow (log only) — ${ms}ms`);
   log('───────────────────────────────────');
 }
 
@@ -611,7 +606,8 @@ async function runMacroOutlook({ dryRun = false } = {}) {
 
 function runDarkpoolCheck() {
   // /api/darkpool/prints is not available on the Founding plan.
-  // Flow data is available via signa.flowScore in the hourly scan → #darkpool.
+  // Flow (signa.flowScore) is computed in the hourly scan but no longer
+  // published — the #darkpool channel was retired.
 }
 
 function runEarningsCheck() {
@@ -737,7 +733,7 @@ async function startup() {
   log(`Hourly scan: ${WATCHLIST.length} signals + ${WATCHLIST.length} GEX (per-ticker) + 1 quota ≈ ${WATCHLIST.length * 2 + 1} calls/hr`);
   log('');
   log('Scheduled jobs (America/New_York, weekdays):');
-  log('  🔁 Hourly scan          :00 every hour     Mon–Fri    → #signals (CALLs) · #micro (grid) · #macro (regime flip) · #darkpool (flow)');
+  log('  🔁 Hourly scan          :00 every hour     Mon–Fri    → #signals (CALLs) · #micro (grid) · #macro (regime flip)');
   if (ENABLE_PREMARKET) {
     log('  🌅 Pre-market brief    09:00 ET           Mon–Fri    → #macro (GEX) · #signals (screener)');
   }
@@ -745,7 +741,7 @@ async function startup() {
   log('  🗓️  Macro outlook       09:15 & 21:15 ET  Mon–Fri    → #macro (regime + top-5 watchlist, 12h cadence)');
   log('');
   log('Disabled (undocumented endpoints on Founding plan):');
-  log('  🌊 Dark pool sweep     (flow data via signa.flowScore in hourly scan → #darkpool)');
+  log('  🌊 Dark pool / flow    (flowScore computed in hourly scan but not published; #darkpool retired)');
   log('  📅 Earnings tracker    (/api/calendar not on Founding; #earnings channel kept)');
   log('  🎯 Multi-model consensus (replaced by hourly CALL verdict routing to #signals)');
   log('');

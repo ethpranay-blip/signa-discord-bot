@@ -122,12 +122,26 @@ async function handleSignaCommand(interaction) {
   }
 }
 
+// planLabel — the /me `plan` field is an object ({ id, label, emoji, … }),
+// so interpolating it directly renders "[object Object]". Pull a display
+// string (label/name/id), prefixing the emoji when present.
+function planLabel(plan) {
+  if (plan == null) return 'unknown';
+  if (typeof plan === 'string') return plan;
+  if (typeof plan === 'object') {
+    const name = plan.label ?? plan.name ?? plan.plan_name ?? plan.tier ?? plan.id;
+    if (name) return plan.emoji ? `${plan.emoji} ${name}` : String(name);
+    return 'unknown';
+  }
+  return String(plan);
+}
+
 async function handleHealthCommand(interaction) {
   try {
     const me = await withTimeout(getMe(), SIGNA_API_TIMEOUT_MS, 'Signa /me');
     const remaining = me?.api?.calls_remaining ?? me?.calls_remaining ?? me?.quota?.remaining ?? null;
     const scopes    = me?.api?.scopes ?? me?.scopes ?? [];
-    const plan      = me?.api?.plan   ?? me?.plan   ?? me?.tier ?? 'unknown';
+    const plan      = planLabel(me?.api?.plan ?? me?.plan ?? me?.tier);
     const user      = me?.email       ?? me?.username ?? me?.user?.email ?? null;
 
     const lines = [
