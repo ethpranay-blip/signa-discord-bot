@@ -53,7 +53,7 @@ import { runMacroCycle } from './lib/channels/macro-handler.js';
 // ---- Paper-validation track logging (measurement only; no behavior change) ----
 // Appends one JSON line per CALL + one cycle-summary line per hourly scan to
 // TRACK_LOG_PATH. Feeds the offline ingest → signa_tracker.xlsx. File writes only.
-import { appendFile } from 'node:fs/promises';
+import { appendFile, stat, readFile } from 'node:fs/promises';
 
 const TRACK_LOG_PATH = process.env.TRACK_LOG_PATH || './signa_track.jsonl';
 
@@ -62,6 +62,29 @@ async function logTrack(record) {
     await appendFile(TRACK_LOG_PATH, JSON.stringify(record) + '\n');
   } catch (e) {
     logErr(`📝 track-log write failed: ${e.message}`);
+  }
+}
+
+// One-time on-startup diagnostic for the paper-validation track log. Prints to
+// stdout (Railway-searchable) so we can confirm the file is present and readable.
+// Wrapped so a diagnostic failure never crashes startup.
+async function logTrackDiagnostic() {
+  const path = process.env.TRACK_LOG_PATH || './signa_track.jsonl';
+  try {
+    let st;
+    try {
+      st = await stat(path);
+    } catch {
+      log(`📝 track-log diagnostic: path=${path} exists=false (will be created on first write)`);
+      return;
+    }
+    const content = await readFile(path, 'utf8');
+    const lines = content.split('\n').filter(Boolean);
+    const last = lines.length ? lines[lines.length - 1] : '(empty)';
+    const lastTrunc = last.length > 120 ? last.slice(0, 120) + '…' : last;
+    log(`📝 track-log diagnostic: path=${path} exists=true size=${st.size} bytes lines=${lines.length} last_line=${lastTrunc}`);
+  } catch (e) {
+    log(`📝 track-log diagnostic: failed to read ${path} (${e.message}) — non-fatal, continuing startup`);
   }
 }
 
@@ -79,6 +102,13 @@ function gexDist(gex) {
 const SIGNA_API_KEY = process.env.SIGNA_API_KEY;
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 const DISCORD_ALERTS_WEBHOOK_URL = process.env.DISCORD_ALERTS_WEBHOOK_URL || DISCORD_WEBHOOK_URL;
+// Dedicated destinations (go-live prep):
+//  - SHARDI: the 6-gate CALL output (strict-filter paper-validation feed). Never
+//    gated. If unset, those CALLs are skipped (NOT routed to #signals).
+//  - OPS: bot startup + auth-failure alerts. Never gated. If unset, falls back
+//    to #signals with a warning.
+const DISCORD_WEBHOOK_SHARDI = process.env.DISCORD_WEBHOOK_SHARDI || null;
+const DISCORD_WEBHOOK_OPS = process.env.DISCORD_WEBHOOK_OPS || null;
 const WATCHLIST = (process.env.WATCHLIST || '')
   .split(',')
   .map(t => t.trim().toUpperCase())
@@ -130,6 +160,29 @@ function route(channel) {
     _fallbackWarned.add(channel);
   }
   return url;
+}
+
+// routeShardi() → the 6-gate CALL webhook. Returns null (and warns once) if
+// DISCORD_WEBHOOK_SHARDI is unset, so callers SKIP the post rather than leak
+// 6-gate CALLs to #signals.
+function routeShardi() {
+  if (DISCORD_WEBHOOK_SHARDI) return DISCORD_WEBHOOK_SHARDI;
+  if (!_fallbackWarned.has('shardi')) {
+    console.warn(`[${ts()}] ⚠️  DISCORD_WEBHOOK_SHARDI not set — 6-gate CALL posts will be skipped. Set this env var to route them.`);
+    _fallbackWarned.add('shardi');
+  }
+  return null;
+}
+
+// routeOps() → the ops/alerts webhook. Falls back to #signals (with a one-time
+// warning) if DISCORD_WEBHOOK_OPS is unset. Never gated.
+function routeOps() {
+  if (DISCORD_WEBHOOK_OPS) return DISCORD_WEBHOOK_OPS;
+  if (!_fallbackWarned.has('ops')) {
+    console.warn(`[${ts()}] ⚠️  DISCORD_WEBHOOK_OPS not set — ops posts routed to #signals until you configure it.`);
+    _fallbackWarned.add('ops');
+  }
+  return route('signals');
 }
 
 // --- In-memory state ---
@@ -297,8 +350,12 @@ function scheduleSignalIndexRetry(reason) {
       }
       log(`🔄 signal-index retry succeeded — regime ${idx.regime}`);
       if (state.lastRegime && state.lastRegime !== idx.regime) {
-        const change = buildRegimeChange(state.lastRegime, idx.regime);
-        await postToDiscord(route('macro'), change, 'regime-change-retry');
+        if (process.env.LEGACY_CHANNEL_POSTS_ENABLED === 'true') {
+          const change = buildRegimeChange(state.lastRegime, idx.regime);
+          await postToDiscord(route('macro'), change, 'regime-change-retry');
+        } else {
+          log('⏭️  regime-change-retry (#macro): skipped — legacy posts disabled');
+        }
       }
       state.lastRegime = idx.regime;
     } catch (err) {
@@ -399,7 +456,7 @@ async function checkQuota() {
     if (/401/i.test(err.message)) {
       haltPolling = true;
       logErr('❌ API key invalid (401) — halting all polling. Fix SIGNA_API_KEY and restart.');
-      await postToDiscord(route('signals'), {
+      await postToDiscord(routeOps(), {
         embeds: [{
           title: '⛔ Signa Bot: API Key Invalid',
           description: 'Received 401 from Signa API. All polling halted. Check SIGNA_API_KEY and restart.',
@@ -475,11 +532,15 @@ async function runHourlyScan() {
   state.lastCycleResults = allResults;
   state.lastCycleTime    = new Date().toISOString();
 
-  // 4. CALL verdicts → #signals (card shows the ticker's OWN GEX)
+  // 4. CALL verdicts → #shardi-setup (DISCORD_WEBHOOK_SHARDI). The 6-gate CALL
+  //    output is NEVER gated; it always fires when a gate passes. If the SHARDI
+  //    webhook is unset, routeShardi() warns once and returns null → we skip the
+  //    post (no fallback to #signals). Card shows the ticker's OWN GEX.
   const callResults = allResults.filter(r => r.verdict.verdict === 'CALL');
+  const shardiUrl = routeShardi();
   for (const r of callResults) {
     const card = buildCallCard(r.ticker, r.signal, r.gex, r.verdict);
-    if (card) await postToDiscord(route('signals'), card, `hourly-call-${r.ticker}`);
+    if (card && shardiUrl) await postToDiscord(shardiUrl, card, `hourly-call-${r.ticker}`);
   }
 
   // ===== PAPER-TRACK LOGGING (measurement layer — file writes only, no posts) =====
@@ -547,21 +608,31 @@ async function runHourlyScan() {
   }
   // ===== END PAPER-TRACK LOGGING =====
 
-  // 5. Watchlist grid → #micro
-  if (allResults.length > 0) {
-    const grid = buildWatchlistGrid(allResults);
-    if (grid) await postToDiscord(route('micro'), grid, 'hourly-grid');
+  // 5. Watchlist grid → #micro (LEGACY display post — gated). 6-gate logic above
+  //    is unaffected.
+  if (process.env.LEGACY_CHANNEL_POSTS_ENABLED === 'true') {
+    if (allResults.length > 0) {
+      const grid = buildWatchlistGrid(allResults);
+      if (grid) await postToDiscord(route('micro'), grid, 'hourly-grid');
+    }
+  } else {
+    log('⏭️  hourly-grid (#micro): skipped — legacy posts disabled');
   }
 
-  // 6. GEX regime → #macro on flip. Derived deterministically (spot vs flip
-  //    with a neutral band) so price hovering at the flip doesn't spam #macro
-  //    with phantom flips. AT_FLIP/unknown is treated as "no change".
+  // 6. GEX regime → #macro on flip (LEGACY display post — gated). Regime state
+  //    is still tracked so behavior is identical when re-enabled. Derived
+  //    deterministically (spot vs flip with a neutral band) so price hovering at
+  //    the flip doesn't spam #macro with phantom flips. AT_FLIP/unknown = no change.
   const spyRegime = deriveGexRegime(spyGex); // 'ABOVE' | 'BELOW' | 'AT_FLIP' | null
   const newGexRegime = spyRegime === 'ABOVE' ? 'ABOVE_FLIP' : spyRegime === 'BELOW' ? 'BELOW_FLIP' : null;
   if (newGexRegime && newGexRegime !== state.lastGexRegime) {
     log(`  GEX regime flip: ${state.lastGexRegime ?? 'none'} → ${newGexRegime}`);
-    const regimeMsg = buildRegimeUpdate(spyGex, qqqGex);
-    if (regimeMsg) await postToDiscord(route('macro'), regimeMsg, 'hourly-regime-flip');
+    if (process.env.LEGACY_CHANNEL_POSTS_ENABLED === 'true') {
+      const regimeMsg = buildRegimeUpdate(spyGex, qqqGex);
+      if (regimeMsg) await postToDiscord(route('macro'), regimeMsg, 'hourly-regime-flip');
+    } else {
+      log('⏭️  hourly-regime-flip (#macro): skipped — legacy posts disabled');
+    }
     state.lastGexRegime = newGexRegime;
   }
 
@@ -599,20 +670,27 @@ async function runNightlyDigest() {
     scheduleSignalIndexRetry(signalIndexRes.reason);
   }
 
-  // Regime change detection (signal-index derived)
+  // Regime change detection (signal-index derived). Post is LEGACY (gated);
+  // state.lastRegime tracking stays so re-enabling behaves identically.
   if (signalIndex?.regime && state.lastRegime && state.lastRegime !== signalIndex.regime) {
-    const change = buildRegimeChange(state.lastRegime, signalIndex.regime);
-    await postToDiscord(route('macro'), change, 'regime-change');
+    if (process.env.LEGACY_CHANNEL_POSTS_ENABLED === 'true') {
+      const change = buildRegimeChange(state.lastRegime, signalIndex.regime);
+      await postToDiscord(route('macro'), change, 'regime-change');
+    }
   }
   if (signalIndex?.regime) state.lastRegime = signalIndex.regime;
 
-  // 1) Regime outlook → #macro
-  const outlook = buildRegimeOutlook(signalIndex, spyGex);
-  if (outlook) await postToDiscord(route('macro'), outlook, 'nightly-regime-outlook');
+  if (process.env.LEGACY_CHANNEL_POSTS_ENABLED === 'true') {
+    // 1) Regime outlook → #macro
+    const outlook = buildRegimeOutlook(signalIndex, spyGex);
+    if (outlook) await postToDiscord(route('macro'), outlook, 'nightly-regime-outlook');
 
-  // 2) CALL summary → #signals
-  const summary = buildNightlySummary(signalIndex, state.lastCycleResults, state.lastCycleTime);
-  if (summary) await postToDiscord(route('signals'), summary, 'nightly-summary');
+    // 2) CALL summary → #signals
+    const summary = buildNightlySummary(signalIndex, state.lastCycleResults, state.lastCycleTime);
+    if (summary) await postToDiscord(route('signals'), summary, 'nightly-summary');
+  } else {
+    log('⏭️  nightly digest (#macro outlook + #signals summary): skipped — legacy posts disabled');
+  }
 
   const ms = Date.now() - t0;
   log(`✓ Digest complete in ${ms}ms — regime ${signalIndex?.regime || 'UNKNOWN'}, ${state.lastCycleResults?.length || 0} in last cycle`);
@@ -650,14 +728,19 @@ async function runPremarketBrief() {
       if (r.status === 'rejected') logErr(`  ⚠️  ${name} failed: ${r.reason?.message}`);
     }
 
-    // Regime update → #macro (GEX walls + signal-index)
-    const regimeMsg = buildRegimeUpdate(spyGex, qqqGex);
-    if (regimeMsg) await postToDiscord(route('macro'), regimeMsg, 'premarket-regime');
+    // Pre-market posts are LEGACY (gated).
+    if (process.env.LEGACY_CHANNEL_POSTS_ENABLED === 'true') {
+      // Regime update → #macro (GEX walls + signal-index)
+      const regimeMsg = buildRegimeUpdate(spyGex, qqqGex);
+      if (regimeMsg) await postToDiscord(route('macro'), regimeMsg, 'premarket-regime');
 
-    // Screener candidates → #signals
-    if (screener) {
-      const brief = buildWatchlistSummary(screener, WATCHLIST);
-      if (brief) await postToDiscord(route('signals'), brief, 'premarket-screener');
+      // Screener candidates → #signals
+      if (screener) {
+        const brief = buildWatchlistSummary(screener, WATCHLIST);
+        if (brief) await postToDiscord(route('signals'), brief, 'premarket-screener');
+      }
+    } else {
+      log('⏭️  pre-market brief (#macro regime + #signals screener): skipped — legacy posts disabled');
     }
   } catch (err) {
     logErr(`❌ premarket-brief failed: ${err.message}`);
@@ -709,8 +792,13 @@ async function runMacroOutlook({ dryRun = false } = {}) {
     const top5 = rankResults(sigs).slice(0, 5);
     log(`  Top 5: ${top5.map(r => `${r.ticker}(${Math.round(Number(r.signal?.signa?.conviction ?? 0))})`).join(', ') || '—'}`);
 
-    const outlook = buildMacroOutlook(signalIndex, spyGex, qqqGex, top5);
-    if (outlook) await postToDiscord(route('macro'), outlook, 'macro-outlook');
+    // 12h macro outlook → #macro is LEGACY (gated).
+    if (process.env.LEGACY_CHANNEL_POSTS_ENABLED === 'true') {
+      const outlook = buildMacroOutlook(signalIndex, spyGex, qqqGex, top5);
+      if (outlook) await postToDiscord(route('macro'), outlook, 'macro-outlook');
+    } else {
+      log('⏭️  macro outlook (#macro): skipped — legacy posts disabled');
+    }
 
     const ms = Date.now() - t0;
     log(`✓ Macro outlook complete in ${ms}ms — regime ${signalIndex?.regime || 'UNKNOWN'}, ${top5.length} top names`);
@@ -902,10 +990,13 @@ async function startup() {
   cron.schedule('15 9 * * 1-5',  () => runMacroCycle(channelCtx()).catch(e => logErr(`#macro cycle failed: ${e.message}`)), { timezone: TZ });
   cron.schedule('15 21 * * 1-5', () => runMacroCycle(channelCtx()).catch(e => logErr(`#macro cycle failed: ${e.message}`)), { timezone: TZ });
 
-  // Startup notice to Discord
+  // One-time track-log diagnostic to stdout (Railway log search).
+  await logTrackDiagnostic();
+
+  // Startup notice → #ops (routeOps falls back to #signals + warns if unset).
   const nextDigest = `${fmtCron(DIGEST_MINUTE, DIGEST_HOUR)} (Mon–Fri)`;
   const startupPayload = buildStartupNotice(me, nextDigest, WATCHLIST.length);
-  await postToDiscord(route('signals'), startupPayload, 'startup');
+  await postToDiscord(routeOps(), startupPayload, 'startup');
 
   // Discord Gateway bot for slash commands. Failure MUST NOT crash cron bot.
   try {
