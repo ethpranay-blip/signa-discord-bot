@@ -1,0 +1,406 @@
+{
+  "generated_at": "2026-06-27T11:49:19.941Z",
+  "source": "signa_tracker.xlsx Tradeable Universe tab",
+  "tickers": [
+    {
+      "ticker": "BTC",
+      "asset_class": "crypto_perp",
+      "exchanges": "V, HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "ETH",
+      "asset_class": "crypto_perp",
+      "exchanges": "V, HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "SOL",
+      "asset_class": "crypto_perp",
+      "exchanges": "V, HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "BNB",
+      "asset_class": "crypto_perp",
+      "exchanges": "V, HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "XRP",
+      "asset_class": "crypto_perp",
+      "exchanges": "V, HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "DOGE",
+      "asset_class": "crypto_perp",
+      "exchanges": "V, HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "ADA",
+      "asset_class": "crypto_perp",
+      "exchanges": "V, HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "AVAX",
+      "asset_class": "crypto_perp",
+      "exchanges": "V, HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "LINK",
+      "asset_class": "crypto_perp",
+      "exchanges": "V, HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "LTC",
+      "asset_class": "crypto_perp",
+      "exchanges": "V, HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "DOT",
+      "asset_class": "crypto_perp",
+      "exchanges": "V, HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "TON",
+      "asset_class": "crypto_perp",
+      "exchanges": "V, HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "TRX",
+      "asset_class": "crypto_perp",
+      "exchanges": "V, HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "SUI",
+      "asset_class": "crypto_perp",
+      "exchanges": "V, HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "NEAR",
+      "asset_class": "crypto_perp",
+      "exchanges": "V, HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "APT",
+      "asset_class": "crypto_perp",
+      "exchanges": "HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "ARB",
+      "asset_class": "crypto_perp",
+      "exchanges": "V, HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "OP",
+      "asset_class": "crypto_perp",
+      "exchanges": "HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "POL",
+      "asset_class": "crypto_perp",
+      "exchanges": "HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "INJ",
+      "asset_class": "crypto_perp",
+      "exchanges": "HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "SEI",
+      "asset_class": "crypto_perp",
+      "exchanges": "HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "TIA",
+      "asset_class": "crypto_perp",
+      "exchanges": "HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "ATOM",
+      "asset_class": "crypto_perp",
+      "exchanges": "V, HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "BCH",
+      "asset_class": "crypto_perp",
+      "exchanges": "V, HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "FIL",
+      "asset_class": "crypto_perp",
+      "exchanges": "HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "PEPE",
+      "asset_class": "crypto_perp",
+      "exchanges": "V, HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "WIF",
+      "asset_class": "crypto_perp",
+      "exchanges": "HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "HYPE",
+      "asset_class": "crypto_perp",
+      "exchanges": "HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": false
+    },
+    {
+      "ticker": "AAPL",
+      "asset_class": "tokenized_equity",
+      "exchanges": "HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": true
+    },
+    {
+      "ticker": "TSLA",
+      "asset_class": "tokenized_equity",
+      "exchanges": "HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": true
+    },
+    {
+      "ticker": "NVDA",
+      "asset_class": "tokenized_equity",
+      "exchanges": "HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": true
+    },
+    {
+      "ticker": "AMZN",
+      "asset_class": "tokenized_equity",
+      "exchanges": "HL, B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": true
+    },
+    {
+      "ticker": "GOOGL",
+      "asset_class": "tokenized_equity",
+      "exchanges": "HL",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": true
+    },
+    {
+      "ticker": "META",
+      "asset_class": "tokenized_equity",
+      "exchanges": "HL",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": true
+    },
+    {
+      "ticker": "MSFT",
+      "asset_class": "tokenized_equity",
+      "exchanges": "HL",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": true
+    },
+    {
+      "ticker": "MSTR",
+      "asset_class": "tokenized_equity",
+      "exchanges": "B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": true
+    },
+    {
+      "ticker": "COIN",
+      "asset_class": "tokenized_equity",
+      "exchanges": "B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": true
+    },
+    {
+      "ticker": "INTC",
+      "asset_class": "tokenized_equity",
+      "exchanges": "B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": true
+    },
+    {
+      "ticker": "AMD",
+      "asset_class": "tokenized_equity",
+      "exchanges": "B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": true
+    },
+    {
+      "ticker": "NFLX",
+      "asset_class": "tokenized_equity",
+      "exchanges": "HL",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": true
+    },
+    {
+      "ticker": "HOOD",
+      "asset_class": "tokenized_equity",
+      "exchanges": "B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": true
+    },
+    {
+      "ticker": "PLTR",
+      "asset_class": "tokenized_equity",
+      "exchanges": "B",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": true
+    },
+    {
+      "ticker": "SPY",
+      "asset_class": "etf",
+      "exchanges": "HL",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": true
+    },
+    {
+      "ticker": "QQQ",
+      "asset_class": "etf",
+      "exchanges": "HL",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": true
+    },
+    {
+      "ticker": "LLY",
+      "asset_class": "tokenized_equity",
+      "exchanges": "V",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": true
+    },
+    {
+      "ticker": "TSM",
+      "asset_class": "tokenized_equity",
+      "exchanges": "V, HL",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": true
+    },
+    {
+      "ticker": "ASML",
+      "asset_class": "tokenized_equity",
+      "exchanges": "HL",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": true
+    },
+    {
+      "ticker": "ORCL",
+      "asset_class": "tokenized_equity",
+      "exchanges": "HL",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": true
+    },
+    {
+      "ticker": "NVO",
+      "asset_class": "tokenized_equity",
+      "exchanges": "V",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": true
+    },
+    {
+      "ticker": "RKLB",
+      "asset_class": "tokenized_equity",
+      "exchanges": "V",
+      "signals_eligible": true,
+      "micro_eligible": true,
+      "macro_eligible": true
+    }
+  ]
+}
