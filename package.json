@@ -15,7 +15,9 @@
     "discord.js": "^14.16.3",
     "dotenv": "^16.4.5",
     "node-cron": "^3.0.3",
-    "node-fetch": "^3.3.2",
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
     "xlsx": "^0.18.5"
   },
   "overrides": {
