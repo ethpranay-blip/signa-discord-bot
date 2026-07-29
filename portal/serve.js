@@ -36,6 +36,9 @@ function overCap(cap) {
 function tokenOk(req, token) {
   if (!token) return true; // no token configured → open (local use)
   if (req.headers['x-portal-token'] === token) return true;
+  // Cookie set on first successful ?token= visit, so the portal is remembered
+  // for 30 days instead of demanding the code on every page load.
+  if ((req.headers.cookie || '').split(/;\s*/).includes('pt=' + token)) return true;
   try {
     const u = new URL(req.url, 'http://x');
     if (u.searchParams.get('token') === token) return true;
@@ -68,6 +71,18 @@ export function startPortal({ log = console.log, trackLogPath } = {}) {
         if (!tokenOk(req, TOKEN)) {
           res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
           res.end('<!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><body style="font-family:ui-monospace,monospace;background:#0B0F14;color:#E7EEF6;display:grid;place-items:center;min-height:95vh;margin:0"><form style="text-align:center"><div style="font-size:22px;margin-bottom:6px">📡 SIGNA TERMINAL</div><div style="color:#8493A3;font-size:13px;margin-bottom:18px">Enter access code</div><input name=token autofocus style="font:inherit;padding:10px 14px;border-radius:8px;border:1px solid #2F3D4C;background:#121A23;color:#E7EEF6;outline:none;text-align:center"><div style="margin-top:14px"><button style="font:inherit;padding:9px 22px;border-radius:8px;border:0;background:#E7AF4B;color:#111;cursor:pointer">Open</button></div></form></body>');
+          return;
+        }
+        // First arrival with a valid ?token= → drop a 30-day cookie and redirect
+        // to the clean URL, so the code isn't needed (or visible) again.
+        let viaQuery = false;
+        try { viaQuery = new URL(req.url, 'http://x').searchParams.get('token') === TOKEN; } catch {}
+        if (TOKEN && viaQuery) {
+          res.writeHead(302, {
+            Location: '/',
+            'Set-Cookie': `pt=${TOKEN}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`,
+          });
+          res.end();
           return;
         }
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
