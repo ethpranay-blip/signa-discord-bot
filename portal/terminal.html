@@ -296,7 +296,7 @@
     <div class="thesis" id="thesis"><div class="tc-empty">Pick a ticker from the screener<br>to load its full thesis.</div></div>
   </div>
 
-  <div class="sh"><h2>Call Performance</h2><span class="cnt" id="ocCnt">—</span><span class="rt">first-touch scoring vs daily candles · from the paper-validation log</span></div>
+  <div class="sh"><h2>Call Performance</h2><span class="cnt" id="ocCnt">—</span><span class="rt">first-touch scoring vs daily candles · repeats of the same setup merged</span></div>
   <div class="oc-grid" id="ocTiles"></div>
   <div class="oc-list" id="ocList"></div>
 
@@ -420,7 +420,23 @@
       res=await r.json();
     }catch(e){return;} // keep the baked snapshot
     if(!res||!Array.isArray(res.rows))return;
-    var calls=res.rows.filter(function(x){return x.type==='call';});
+    var raw=res.rows.filter(function(x){return x.type==='call';});
+    // Retroactive de-duplication. Cycles re-evaluate hourly, so a setup that stays
+    // valid was logged again every run (AAPL: 222 rows / 20 days). Scoring those as
+    // separate trades makes the stats meaningless — it just re-counts one outcome
+    // dozens of times. Collapse repeats of the same setup (same channel+ticker+
+    // direction, levels within 1%, inside 7 days) down to their first occurrence.
+    var seen={},calls=[],dupes=0;
+    raw.forEach(function(c){
+      var k=(c.channel||'')+'|'+String(c.ticker).toUpperCase()+'|'+String(c.direction||'').toUpperCase();
+      var t=Date.parse(String(c.call_id||'').slice(0,24))||0, p=seen[k];
+      var moved=!p||Math.abs(c.entry-p.entry)/Math.abs(c.entry||1)*100>1
+                  ||Math.abs(c.stop-p.stop)/Math.abs(c.stop||1)*100>1
+                  ||Math.abs(c.target-p.target)/Math.abs(c.target||1)*100>1;
+      if(!p||moved||(t-p.t)>7*864e5){seen[k]={entry:c.entry,stop:c.stop,target:c.target,t:t};calls.push(c);}
+      else dupes++;
+    });
+    SNAP._dupes=dupes; SNAP._rawCalls=raw.length;
     var scored=[];
     for(var i=0;i<calls.length;i++){ try{scored.push(await scoreCall(calls[i]));}catch(e){} }
     var closed=scored.filter(function(o){return o.status==='target'||o.status==='stop';});
@@ -436,7 +452,7 @@
 
   function drawOutcomes(){
     var oc=SNAP.outcomes||{calls:[],stats:{}};var st=oc.stats||{};
-    $('ocCnt').textContent=(st.total||0)+' tracked'+(oc.cycles?(' · '+oc.cycles+' cycles'):'');
+    $('ocCnt').textContent=(st.total||0)+' setups'+(SNAP._dupes?(' · '+SNAP._dupes+' repeats merged'):'')+(oc.cycles?(' · '+oc.cycles+' cycles'):'');
     var tiles=[
       {k:'Hit rate',v:st.hit_rate!=null?st.hit_rate+'%':'—',cls:st.hit_rate>=55?'good':st.hit_rate!=null?'bad':''},
       {k:'Avg R (closed)',v:st.avg_r!=null?((st.avg_r>=0?'+':'')+st.avg_r+'R'):'—',cls:st.avg_r>0?'good':st.avg_r!=null?'bad':''},

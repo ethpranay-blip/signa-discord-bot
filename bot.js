@@ -1014,6 +1014,18 @@ async function startup() {
   // One-time track-log diagnostic to stdout (Railway log search).
   await logTrackDiagnostic();
 
+  // Seed call-dedupe state from the existing log so a redeploy doesn't re-log
+  // setups that are already recorded (the channel cycles re-evaluate hourly).
+  try {
+    const { seedFromRows } = await import('./lib/channels/call-dedupe.js');
+    const raw = await readFile(TRACK_LOG_PATH, 'utf8').catch(() => '');
+    const rows = raw.split('\n').filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const n = seedFromRows(rows);
+    log(`🔁 call-dedupe seeded from ${n} logged call(s) — repeats of live setups won't be re-logged`);
+  } catch (e) {
+    logErr(`call-dedupe seed skipped: ${e.message}`);
+  }
+
   // Startup notice → #ops (routeOps falls back to #signals + warns if unset).
   const nextDigest = `${fmtCron(DIGEST_MINUTE, DIGEST_HOUR)} (Mon–Fri)`;
   const startupPayload = buildStartupNotice(me, nextDigest, WATCHLIST.length);
