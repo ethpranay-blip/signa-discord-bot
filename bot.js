@@ -381,7 +381,20 @@ function computeVerdict(signalData, tickerGex) {
     ? (Date.now() - new Date(engine.runAt).getTime()) < 86_400_000
     : false;
 
-  const intendedDir = String(signa.action || '').toUpperCase();
+  // Intended trade side. NOTE (fix 2026-07-27): this used to read signa.action,
+  // but that field speaks BUY/HOLD/AVOID — it never returns LONG/SHORT. Gates 3
+  // and 5 compare against LONG/SHORT, so they failed 100% of the time and a CALL
+  // was mathematically impossible (track log: g3 82/82, g5 82/82 fails).
+  // Direction lives on the engine surface as BULLISH/BEARISH (same lesson as
+  // SIGNA_FIELD_AUDIT.md); signa.action is the fallback, mapped to a side.
+  const engineDir = String(engine.direction || '').toUpperCase();
+  const actionDir = String(signa.action || '').toUpperCase();
+  const intendedDir =
+      engineDir === 'BULLISH' ? 'LONG'
+    : engineDir === 'BEARISH' ? 'SHORT'
+    : actionDir === 'BUY'     ? 'LONG'
+    : actionDir === 'AVOID'   ? 'SHORT'
+    : '';   // NEUTRAL / HOLD / unknown → no committed side, gate 3 fails as intended
 
   const gate1 = signa.alphaEvent === true;
   const gate2 = ['A+', 'A'].includes(String(signa.grade || '').toUpperCase());
@@ -410,7 +423,10 @@ function computeVerdict(signalData, tickerGex) {
   const gate6 = data.stop != null && data.target != null;
 
   const verdict = (gate1 && gate2 && gate3 && gate4 && gate5 === true && gate6) ? 'CALL' : 'NO-CALL';
-  return { verdict, gates: { gate1, gate2, gate3, gate4, gate5, gate6 }, engineFresh };
+  // intendedDir is returned so the track log records the real trade side
+  // (LONG/SHORT) instead of signa.action — outcome scoring needs the side to know
+  // which of stop/target to test first.
+  return { verdict, gates: { gate1, gate2, gate3, gate4, gate5, gate6 }, engineFresh, intendedDir };
 }
 
 // sanitizeGex — wrap a getGex() result. Returns the raw GEX response if
@@ -571,10 +587,15 @@ async function runHourlyScan() {
       const d = r.signal?.data || {};
       await logTrack({
         type: 'call',
-        call_id: `${state.lastCycleTime}-${r.ticker}-${String(s.action || '').toUpperCase()}`,
+        channel: 'shardi',                    // distinguishes 6-gate rows from channel-feed rows
+        call_id: `${state.lastCycleTime}-${r.ticker}-${r.verdict.intendedDir || 'NONE'}-shardi`,
         ts_et: nowEt,
         ticker: r.ticker,
-        direction: String(s.action || '').toUpperCase(),
+        // The real trade side (LONG/SHORT) from computeVerdict — NOT signa.action,
+        // which speaks BUY/HOLD/AVOID and can't be scored against stop/target.
+        direction: r.verdict.intendedDir || null,
+        action: String(s.action || '').toUpperCase() || null,   // keep Signa's own label too
+        engine_direction: String(r.signal?.engine?.direction || '').toUpperCase() || null,
         grade: String(s.grade || '').toUpperCase(),
         conviction: s.conviction ?? null,
         flow_score: s.flowScore ?? null,
@@ -1003,6 +1024,20 @@ async function startup() {
     await startDiscordBot();
   } catch (err) {
     logErr(`Discord bot failed to start (cron jobs unaffected): ${err.message}`);
+  }
+
+  // Signa Terminal portal (portal/serve.js) — token-gated Signa proxy + the
+  // paper-validation track log over HTTP, bound to $PORT so Railway can expose
+  // it. This is the ONLY process with access to the track-log volume, so the
+  // dashboard's performance scoreboard reads production calls through here.
+  // Opt out with PORTAL_ENABLED=false. Failure MUST NOT crash the cron bot.
+  if ((process.env.PORTAL_ENABLED || 'true').toLowerCase() === 'true') {
+    try {
+      const { startPortal } = await import('./portal/serve.js');
+      startPortal({ log, trackLogPath: TRACK_LOG_PATH });
+    } catch (err) {
+      logErr(`Portal failed to start (cron jobs unaffected): ${err.message}`);
+    }
   }
 
   log('Bot is running. Press Ctrl+C to stop.\n');
