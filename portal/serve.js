@@ -65,7 +65,17 @@ export function startPortal({ log = console.log, trackLogPath } = {}) {
 
   const server = http.createServer(async (req, res) => {
     try {
-      const clean = req.url.split('?')[0];
+      // SECURITY: match the whitelist against the NORMALIZED pathname, never the
+      // raw URL. A whitelisted prefix plus traversal (v1/gex/x/../../../v1/me)
+      // otherwise satisfies the regex and fetch() resolves the ".." — reaching
+      // any app.getsigna.ai path with the server's API key. Reject encoded
+      // traversal outright, then normalize.
+      if (/%2e/i.test(req.url) || req.url.split('?')[0].includes('..')) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end('{"error":"bad path"}');
+        return;
+      }
+      const clean = new URL(req.url, 'http://x').pathname;
 
       if (clean === '/' || clean === '/index.html') {
         if (!tokenOk(req, TOKEN)) {
